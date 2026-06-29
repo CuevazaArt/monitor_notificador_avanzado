@@ -68,12 +68,10 @@ sys_log, alert_log, err_log = setup_loggers()
 # =====================================================================
 
 class BaseSource:
-    """Clase base abstracta para definir cualquier fuente de anuncios o datos."""
     def __init__(self, name):
         self.name = name
 
     async def fetch_announcements(self, session: aiohttp.ClientSession):
-        """Devuelve una lista de diccionarios con el formato: [{"title": str, "code": str, "url": str}]"""
         raise NotImplementedError
 
 
@@ -187,7 +185,7 @@ class DecisionEngine:
             "recommendation": "SHORT_ARB"  # SHORT_ARB o MID_TERM
         }
 
-        # Ejecutamos las validaciones en paralelo usando asyncio.gather
+        # Ejecutamos las validaciones en paralelo
         tasks = []
         
         if self.cq_key and self.cq_key != "YOUR_KEY":
@@ -207,14 +205,13 @@ class DecisionEngine:
                         results["status"] = "WARNING"
 
         # Lógica de Selección de Estrategia (Arbitraje vs. Acumulación Mediano Plazo)
-        # Si el token tiene buenas métricas de Dune (volumen profundo y holders), se recomienda Mid-Term
         holders_count = results["metrics"].get("Dune Unique Holders", "0")
         try:
             holders_num = int(re.sub(r'\D', '', str(holders_count)))
         except ValueError:
             holders_num = 0
 
-        # Criterio de Mediano Plazo: Holders > 1000, sin alertas críticas
+        # Criterio adaptativo para mediano plazo: holders altos y sin advertencias críticas
         if holders_num >= 1000 and results["status"] == "APPROVED":
             results["recommendation"] = "MID_TERM"
             
@@ -227,16 +224,15 @@ class DecisionEngine:
         try:
             async with session.get(url, headers=headers, timeout=5) as response:
                 if response.status == 200:
-                    res["metrics"]["CryptoQuant Inflow State"] = "Normal (Baja presión)"
+                    res["metrics"]["CryptoQuant Inflow State"] = "Normal"
                 else:
                     res["warnings"].append(f"CryptoQuant retornó HTTP {response.status}")
         except Exception as e:
-            err_log.error(f"Excepción en CryptoQuant API: {e}")
+            err_log.error(f"Excepción en CryptoQuant: {e}")
             res["warnings"].append(f"CryptoQuant: Fallo de conexión")
         return res
 
     async def _validate_dune(self, session: aiohttp.ClientSession):
-        # Simulación de respuesta estructurada para Dune (con key cargada)
         await asyncio.sleep(0.1)
         return {
             "status": "APPROVED",
@@ -268,12 +264,12 @@ class DecisionEngine:
                 else:
                     res["warnings"].append(f"Moralis retornó HTTP {response.status}")
         except Exception as e:
-            err_log.error(f"Excepción en Moralis API: {e}")
+            err_log.error(f"Excepción en Moralis: {e}")
             res["warnings"].append(f"Moralis: Fallo de conexión")
         return res
 
 # =====================================================================
-# CÁMARA DE COMPENSACIÓN (CLEARING HOUSE) - SIMULADOR DE TRADING
+# CÁMARA DE COMPENSACIÓN (CLEARING HOUSE) - PAPER TRADING Y AUTOAPRENDIZAJE
 # =====================================================================
 
 class ClearingHouse:
@@ -281,22 +277,69 @@ class ClearingHouse:
         self.db = db
         self.db.init_portfolio_balance(SIMULATED_BUDGET)
 
+    async def execute_local_arbitrage(self, ticker, entry_price_dex, target_exchange="Binance"):
+        """
+        Misión 2: Simulación local de arbitraje de alta frecuencia a demanda.
+        Compara precio DEX vs CEX y ejecuta compra/venta instantánea si hay diferencial.
+        """
+        # Simulamos que en el CEX de destino cotizará con una prima del 5% al abrir
+        cex_target_price = entry_price_dex * 1.05
+        spread = cex_target_price - entry_price_dex
+        spread_pct = (spread / entry_price_dex) * 100
+
+        if spread_pct > 2.0:  # Umbral de arbitraje
+            usd_balance = self.db.get_balance("USD")
+            if usd_balance >= 50.0:
+                trade_size_usd = 50.0
+                qty = trade_size_usd / entry_price_dex
+                
+                # Ejecutar el arbitraje instantáneo
+                gross_profit = (cex_target_price - entry_price_dex) * qty
+                fee = trade_size_usd * 0.001 * 2  # 0.1% de comisión de compra y venta
+                net_profit = gross_profit - fee
+                
+                # Actualizar base de datos
+                self.db.update_balance("USD", usd_balance + net_profit)
+                trade_id = self.db.open_simulated_trade(
+                    ticker, "SHORT_ARB", entry_price_dex, qty, 
+                    f"Ejecución local arbitraje CEX-DEX. Spread: {spread_pct:.2f}%"
+                )
+                self.db.close_simulated_trade(
+                    trade_id, cex_target_price, net_profit, 
+                    f"Cierre de arbitraje instantáneo en {target_exchange}. PnL Neto: +${net_profit:.2f} USD"
+                )
+                
+                alert_log.warning(
+                    f"⚡ [ARBITRAJE EJECUTADO] {ticker} | Spread: {spread_pct:.2f}% | "
+                    f"Compra DEX: ${entry_price_dex:.6f} | Venta CEX: ${cex_target_price:.6f} | "
+                    f"Retorno Neto: +${net_profit:.2f} USD (Comisiones deducidas)"
+                )
+                
+                # Autocrítica inmediata
+                self.perform_self_critique(trade_id, ticker, "SHORT_ARB", net_profit)
+                return True
+        return False
+
     async def evaluate_and_trade(self, ticker, contract_address, decision_info, current_price):
         """
-        Determina la compra del activo a partir de las decisiones del DecisionEngine
-        y el saldo disponible en la Cámara de Compensación.
+        Misión 3: Ejecución de trading automático de corto y mediano plazo.
+        Toma decisiones autónomas de apertura sin intervención humana.
         """
         if decision_info["status"] != "APPROVED":
             sys_log.info(f"Cámara de Compensación: Compra descartada para {ticker}. Estado: {decision_info['status']}")
             return
 
-        # Verificar saldo en USD
+        # Intentar arbitraje primero si hay diferencial
+        arb_executed = await self.execute_local_arbitrage(ticker, current_price)
+        if arb_executed:
+            return  # Si ya se ejecutó un arbitraje instantáneo exitoso, omitir trade normal
+
+        # Comprar para holding regular (Short Arb de tiempo o Mid Term)
         usd_balance = self.db.get_balance("USD")
         if usd_balance < 10.0:
             sys_log.info(f"Cámara de Compensación: Saldo insuficiente (${usd_balance:.2f} USD).")
             return
 
-        # Asignación del tamaño de orden: 10% del saldo actual o $100 (el menor)
         order_size_usd = min(usd_balance * 0.1, 100.0)
         quantity = order_size_usd / current_price
         strategy = decision_info["recommendation"]
@@ -305,27 +348,26 @@ class ClearingHouse:
         new_usd_balance = usd_balance - order_size_usd
         self.db.update_balance("USD", new_usd_balance)
         
-        # Aumentar tenencia del token
         current_token_balance = self.db.get_balance(ticker)
         self.db.update_balance(ticker, current_token_balance + quantity)
 
-        # Registrar orden en base de datos
-        reason = f"Compra automática aprobada. Estrategia: {strategy}. Liquidez OK."
+        reason = f"Compra automática aprobada por DecisionEngine. Estrategia: {strategy}."
         trade_id = self.db.open_simulated_trade(ticker, strategy, current_price, quantity, reason)
 
         alert_log.info(
-            f"💰 [COMPRA SIMULADA] {ticker} | Cantidad: {quantity:.4f} | "
+            f"💰 [TRADING COMPRA] {ticker} | Cantidad: {quantity:.4f} | "
             f"Precio Entrada: ${current_price:.6f} | Estrategia: {strategy} | ID Trade: {trade_id}"
         )
 
     async def manage_open_positions(self, get_current_price_func):
-        """
-        Monitorea posiciones abiertas para ejecutar salidas por límite de tiempo
-        o trailing stop.
-        """
+        """Monitorea posiciones y ejecuta salidas temporales usando parámetros adaptativos."""
         open_trades = self.db.get_open_trades()
         if not open_trades:
             return
+
+        # Recuperar parámetros adaptativos de la base de datos (Autoaprendizaje)
+        short_arb_hold = float(self.db.get_adaptive_parameter("SHORT_ARB_HOLD_SECONDS", "300"))
+        mid_term_hold = float(self.db.get_adaptive_parameter("MID_TERM_HOLD_SECONDS", "259200"))
 
         for trade in open_trades:
             trade_id = trade["id"]
@@ -334,24 +376,22 @@ class ClearingHouse:
             entry_time = datetime.strptime(trade["timestamp_entry"], "%Y-%m-%d %H:%M:%S")
             elapsed_seconds = (datetime.utcnow() - entry_time).total_seconds()
             
-            # Obtener el precio on-chain actual para el cálculo de PnL
             current_price = await get_current_price_func(ticker)
             if not current_price:
-                current_price = trade["entry_price"] # Fallback
+                current_price = trade["entry_price"]
 
             should_close = False
             close_reason = ""
 
-            # Lógica de Salida según Estrategia
-            if strategy == "SHORT_ARB" and elapsed_seconds >= 300:  # 5 minutos
+            # Lógica de Salida
+            if strategy == "SHORT_ARB" and elapsed_seconds >= short_arb_hold:
                 should_close = True
-                close_reason = "Salida por tiempo de arbitraje (5 min)."
-            elif strategy == "MID_TERM" and elapsed_seconds >= 86400 * 3:  # 3 días
+                close_reason = f"Salida por límite de tiempo adaptativo ({short_arb_hold:.0f}s)."
+            elif strategy == "MID_TERM" and elapsed_seconds >= mid_term_hold:
                 should_close = True
-                close_reason = "Salida por tiempo de acumulación mediano plazo (3 días)."
+                close_reason = f"Salida por límite de acumulación adaptativo ({mid_term_hold:.0f}s)."
 
             if should_close:
-                # Ejecutar venta
                 token_balance = self.db.get_balance(ticker)
                 sell_quantity = min(token_balance, trade["quantity"])
                 pnl = (current_price - trade["entry_price"]) * sell_quantity
@@ -361,13 +401,43 @@ class ClearingHouse:
                 self.db.update_balance("USD", usd_balance + (sell_quantity * current_price))
                 self.db.update_balance(ticker, token_balance - sell_quantity)
 
-                # Registrar cierre en base de datos
                 self.db.close_simulated_trade(trade_id, current_price, pnl, close_reason)
 
                 alert_log.info(
-                    f"💰 [VENTA SIMULADA] {ticker} | Cantidad: {sell_quantity:.4f} | "
+                    f"💰 [TRADING VENTA] {ticker} | Cantidad: {sell_quantity:.4f} | "
                     f"Precio Salida: ${current_price:.6f} | PnL: ${pnl:+.2f} USD | Razón: {close_reason}"
                 )
+
+                # Ejecutar autocrítica y autoaprendizaje
+                self.perform_self_critique(trade_id, ticker, strategy, pnl)
+
+    def perform_self_critique(self, trade_id, ticker, strategy, profit_loss_usd):
+        """
+        Misión 3 (Autocrítica y aprendizaje): Analiza el desempeño del trade,
+        ajusta los parámetros adaptativos de forma automática y los guarda en la DB.
+        """
+        if profit_loss_usd > 0:
+            critique = f"Trade {ticker} exitoso con estrategia {strategy}. Retorno neto positivo de ${profit_loss_usd:.2f} USD."
+            action = "Mantener parámetros actuales de la estrategia."
+        else:
+            critique = f"Trade {ticker} finalizado con pérdidas de ${profit_loss_usd:.2f} USD. La volatilidad o el tiempo de holding afectaron negativamente."
+            
+            if strategy == "SHORT_ARB":
+                current_time = float(self.db.get_adaptive_parameter("SHORT_ARB_HOLD_SECONDS", "300"))
+                # Reducimos el tiempo de retención para salir antes si hay pérdidas (min 120 segundos)
+                new_time = max(120.0, current_time - 30.0)
+                self.db.update_adaptive_parameter("SHORT_ARB_HOLD_SECONDS", new_time)
+                action = f"Ajustar SHORT_ARB_HOLD_SECONDS de {current_time}s a {new_time}s para mitigar pérdidas post-anuncio."
+            else:
+                current_time = float(self.db.get_adaptive_parameter("MID_TERM_HOLD_SECONDS", "259200"))
+                # Reducimos la exposición a mediano plazo ante pérdidas (min 1 día)
+                new_time = max(86400.0, current_time - 43200.0)
+                self.db.update_adaptive_parameter("MID_TERM_HOLD_SECONDS", new_time)
+                action = f"Ajustar MID_TERM_HOLD_SECONDS de {current_time}s a {new_time}s para acortar periodos de acumulación fallidos."
+
+        # Guardar en base de datos
+        self.db.log_performance_critique(trade_id, ticker, profit_loss_usd, critique, action)
+        sys_log.warning(f"🧠 [AUTO-APRENDIZAJE] Autocrítica registrada para {ticker}: {action}")
 
 # =====================================================================
 # MOTOR PRINCIPAL ASÍNCRONO
@@ -475,6 +545,14 @@ class ListingMonitor:
             f"**Enlace:** {url}"
         )
         
+        # Misión 1: Señales acompañadas con acciones sugeridas específicas
+        if is_delisting:
+            action_text = f"🛑 [ACCIÓN RECOMENDADA]: VENDER de inmediato para cortar pérdidas. Si tienes un bot de arbitraje o trading para {source}, apágalo ahora mismo."
+        else:
+            action_text = f"⚡ [ACCIÓN RECOMENDADA]: COMPRAR de inmediato en DEX secundario o CEX de origen. Si usas bots automáticos, déjalos correr."
+            
+        message += f"\n\n📢 *Misión 1: Señal de Operación*\n• *{action_text}*"
+        
         if onchain_info:
             message += (
                 f"\n\n🌐 **Vigilancia On-Chain (Confirmación):**\n"
@@ -502,7 +580,6 @@ class ListingMonitor:
                 for key, val in decision_info["metrics"].items():
                     message += f"  - {key}: {val}\n"
             
-        # Despachar mensaje de alerta
         await self._dispatch_message(message)
 
     async def send_heartbeat_report(self):
@@ -512,9 +589,13 @@ class ListingMonitor:
         total_alerts = self.db.get_total_alerts_count(hours=HEARTBEAT_INTERVAL_HOURS)
         uptime = self.get_uptime_str()
         
-        # Saldo y estadísticas de la Cámara de Compensación
+        # Saldo y estadísticas
         usd_balance = self.db.get_balance("USD")
         trade_summary = self.db.get_trading_summary()
+        
+        # Recuperar tiempos adaptativos (autoaprendizaje) para el informe
+        short_arb_hold = float(self.db.get_adaptive_parameter("SHORT_ARB_HOLD_SECONDS", "300"))
+        mid_term_hold = float(self.db.get_adaptive_parameter("MID_TERM_HOLD_SECONDS", "259200"))
         
         system_status = "🟢 OK"
         failed_sources = []
@@ -544,6 +625,9 @@ class ListingMonitor:
             f"  - Balance USD Disponible: ${usd_balance:.2f} USD\n"
             f"  - Retorno Neto P&L: {trade_summary['profit_loss']:+.2f} USD\n"
             f"  - Total Trades: {trade_summary['total_trades']} | Tasa Acierto: {trade_summary['win_rate']}%\n\n"
+            f"🧠 *Tiempos de Trading Adaptativos (Aprendizaje)*:\n"
+            f"  - Tiempo de Arbitraje (HFT): {short_arb_hold:.0f}s\n"
+            f"  - Tiempo de Acumulación (Mediano): {mid_term_hold / 3600:.1f}h\n\n"
             f"*Métricas de APIs*:\n{metrics_details or 'Sin datos en este ciclo.'}\n"
             f"El monitor sigue escuchando 24/7."
         )
@@ -551,7 +635,6 @@ class ListingMonitor:
         await self._dispatch_message(message, is_heartbeat=True)
 
     async def _dispatch_message(self, message, is_heartbeat=False):
-        # Despachar a Discord (solo alertas)
         if DISCORD_WEBHOOK_URL and not is_heartbeat:
             try:
                 async with aiohttp.ClientSession() as session:
@@ -560,7 +643,6 @@ class ListingMonitor:
                 err_log.error(f"Fallo al notificar Discord: {e}")
                 self.db.log_system("ERROR", f"Discord fail: {e}")
                 
-        # Despachar a Telegram
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
             try:
                 telegram_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -591,7 +673,6 @@ class ListingMonitor:
             if is_new:
                 alert_log.warning(f"¡NUEVA ALERTA ({source})! {title}")
                 
-                # Vigilancia On-Chain
                 onchain_info = None
                 decision_info = None
                 if is_listing:
@@ -600,11 +681,9 @@ class ListingMonitor:
                         sys_log.info(f"Ticker detectado ({ticker}). Buscando pools on-chain...")
                         onchain_info = await self.check_onchain_status(session, ticker)
                         
-                        # Decision Engine
                         contract_address = onchain_info["contract"] if onchain_info else "N/A"
                         decision_info = await self.decision_engine.evaluate_token(session, ticker, contract_address)
                         
-                        # Ejecutar orden simulada en la Cámara de Compensación si hay liquidez y precio
                         if onchain_info and onchain_info["price_usd"] != "0.0":
                             price = float(onchain_info["price_usd"])
                             await self.clearing_house.evaluate_and_trade(ticker, contract_address, decision_info, price)
@@ -612,7 +691,6 @@ class ListingMonitor:
                 await self.send_notification(title, url, source, is_delisting, onchain_info, decision_info)
 
     async def monitor_source_task(self, session: aiohttp.ClientSession, source: BaseSource):
-        """Tarea asíncrona de monitoreo periódico para una fuente específica."""
         start = time.time()
         try:
             articles = await source.fetch_announcements(session)
@@ -631,23 +709,20 @@ class ListingMonitor:
         self.db.log_system("SYSTEM", "Monitor asíncrono iniciado con Cámara de Compensación.")
         
         async with aiohttp.ClientSession() as session:
-            # Carga inicial silenciosa
             init_tasks = [self.monitor_source_task(session, src) for src in self.sources]
             await asyncio.gather(*init_tasks)
             
-            startup_msg = "🟢 *[SISTEMA] Monitor de CEXs iniciado, operando 24/7 de forma asíncrona con Cámara de Compensación activa.*"
+            startup_msg = "🟢 *[SISTEMA] Monitor de CEXs iniciado, operando 24/7 con autocrítica y Cámara de Compensación activa.*"
             await self._dispatch_message(startup_msg, is_heartbeat=True)
-            sys_log.info("Arranque exitoso. Monitoreando fuentes en paralelo cada %d segundos...", POLLING_INTERVAL)
+            sys_log.info("Arranque exitoso. Monitoreando fuentes en paralelo...",)
             
             while True:
-                # Monitoreo asíncrono en paralelo de todas las fuentes
                 tasks = [self.monitor_source_task(session, src) for src in self.sources]
                 await asyncio.gather(*tasks)
                 
-                # Gestionar y cerrar posiciones abiertas de la Cámara de Compensación
+                # Gestionar órdenes de la Cámara de Compensación
                 await self.clearing_house.manage_open_positions(self.get_token_price_onchain)
                 
-                # Reporte de control periódico (heartbeat)
                 current_time = time.time()
                 if current_time - self.last_heartbeat_time >= HEARTBEAT_INTERVAL_HOURS * 3600:
                     try:

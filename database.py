@@ -80,6 +80,30 @@ class Database:
                     reason TEXT
                 )
             """)
+
+            # Tabla de Crítica de Desempeño y Autocorrección (Autocritic & Learning)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS performance_critiques (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trade_id INTEGER,
+                    ticker TEXT NOT NULL,
+                    profit_loss_usd REAL NOT NULL,
+                    critique_text TEXT NOT NULL,
+                    adaptive_action TEXT NOT NULL,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(trade_id) REFERENCES simulated_trades(id)
+                )
+            """)
+
+            # Tabla de Parámetros Adaptativos de Estrategia (Estado del Aprendizaje)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS adaptive_parameters (
+                    parameter_name TEXT PRIMARY KEY,
+                    parameter_value TEXT NOT NULL,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
             conn.commit()
 
     def log_alert(self, source, article_code, title, url, is_delisting):
@@ -170,7 +194,6 @@ class Database:
         try:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
-                # Insertar USD si no existe
                 cursor.execute("""
                     INSERT OR IGNORE INTO simulated_balance (asset, amount)
                     VALUES ('USD', ?)
@@ -270,3 +293,41 @@ class Database:
         except Exception as e:
             logging.error(f"Error al obtener resumen de trading: {e}")
             return {"total_trades": 0, "profit_loss": 0.0, "win_rate": 0.0}
+
+    # ---- MÉTODOS DE AUTOCRÍTICA Y APRENDIZAJE ADAPTATIVO ----
+
+    def log_performance_critique(self, trade_id, ticker, profit_loss_usd, critique_text, adaptive_action):
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO performance_critiques (trade_id, ticker, profit_loss_usd, critique_text, adaptive_action)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (trade_id, ticker, profit_loss_usd, critique_text, adaptive_action))
+                conn.commit()
+        except Exception as e:
+            logging.error(f"Error al guardar autocrítica: {e}")
+
+    def update_adaptive_parameter(self, name, value):
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO adaptive_parameters (parameter_name, parameter_value)
+                    VALUES (?, ?)
+                    ON CONFLICT(parameter_name) DO UPDATE SET parameter_value = ?, updated_at = CURRENT_TIMESTAMP
+                """, (name, str(value), str(value)))
+                conn.commit()
+        except Exception as e:
+            logging.error(f"Error al guardar parámetro adaptativo {name}: {e}")
+
+    def get_adaptive_parameter(self, name, default_value):
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT parameter_value FROM adaptive_parameters WHERE parameter_name = ?", (name,))
+                row = cursor.fetchone()
+                return row["parameter_value"] if row else default_value
+        except Exception as e:
+            logging.error(f"Error al recuperar parámetro adaptativo {name}: {e}")
+            return default_value
