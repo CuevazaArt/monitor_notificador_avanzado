@@ -96,5 +96,26 @@ class TestMonitorAndDatabase(unittest.TestCase):
             self.assertEqual(row["profit_loss_usd"], -10.0)
             self.assertEqual(row["adaptive_action"], "Reducir MID_TERM_HOLD_SECONDS")
 
+    def test_blacklist_and_highest_price(self):
+        # 1. Probar registro de precio más alto observado (highest_price)
+        trade_id = self.db.open_simulated_trade("LUNA", "SHORT_ARB", 1.0, 100.0, "Prueba stop")
+        self.assertIsNotNone(trade_id)
+        
+        # Verificar precio inicial
+        open_trades = self.db.get_open_trades()
+        self.assertEqual(open_trades[0]["highest_price"], 1.0)
+        
+        # Actualizar highest_price
+        self.db.update_highest_price(trade_id, 1.5)
+        open_trades_after = self.db.get_open_trades()
+        self.assertEqual(open_trades_after[0]["highest_price"], 1.5)
+
+        # 2. Probar blacklist
+        addr = "0xdeadbeef1234567890abcdef"
+        self.assertFalse(self.db.is_blacklisted(addr))
+        
+        self.db.blacklist_contract(addr, "SCAM", "Tax token / Honeypot")
+        self.assertTrue(self.db.is_blacklisted(addr))
+
 if __name__ == "__main__":
     unittest.main()

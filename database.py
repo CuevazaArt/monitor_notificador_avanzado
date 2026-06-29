@@ -73,6 +73,7 @@ class Database:
                     status TEXT NOT NULL,        -- 'OPEN' o 'CLOSED'
                     entry_price REAL NOT NULL,
                     exit_price REAL,
+                    highest_price REAL DEFAULT 0.0, -- Usado para Trailing Stop-Loss
                     quantity REAL NOT NULL,
                     profit_loss_usd REAL DEFAULT 0.0,
                     timestamp_entry DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -81,7 +82,7 @@ class Database:
                 )
             """)
 
-            # Tabla de Crítica de Desempeño y Autocorrección (Autocritic & Learning)
+            # Tabla de Crítica de Desempeño y Autocorrección
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS performance_critiques (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -95,7 +96,7 @@ class Database:
                 )
             """)
 
-            # Tabla de Parámetros Adaptativos de Estrategia (Estado del Aprendizaje)
+            # Tabla de Parámetros Adaptativos de Estrategia
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS adaptive_parameters (
                     parameter_name TEXT PRIMARY KEY,
@@ -103,6 +104,25 @@ class Database:
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+
+            # Tabla de Lista Negra (Blacklist) de Contratos Fraudulentos
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS blacklist (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    contract_address TEXT UNIQUE NOT NULL,
+                    ticker TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Migración: Verificar si la columna highest_price existe en la tabla simulated_trades
+            try:
+                cursor.execute("SELECT highest_price FROM simulated_trades LIMIT 1")
+            except sqlite3.OperationalError:
+                # Si no existe, la añadimos dinámicamente
+                cursor.execute("ALTER TABLE simulated_trades ADD COLUMN highest_price REAL DEFAULT 0.0")
+                logging.info("Migración: Columna highest_price añadida a la tabla simulated_trades.")
             
             conn.commit()
 
@@ -231,14 +251,23 @@ class Database:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
-                    INSERT INTO simulated_trades (ticker, strategy_type, status, entry_price, quantity, reason)
-                    VALUES (?, ?, 'OPEN', ?, ?, ?)
-                """, (ticker, strategy_type, entry_price, quantity, reason))
+                    INSERT INTO simulated_trades (ticker, strategy_type, status, entry_price, highest_price, quantity, reason)
+                    VALUES (?, ?, 'OPEN', ?, ?, ?, ?)
+                """, (ticker, strategy_type, entry_price, entry_price, quantity, reason))
                 conn.commit()
                 return cursor.lastrowid
         except Exception as e:
             logging.error(f"Error al registrar apertura de trade: {e}")
             return None
+
+    def update_highest_price(self, trade_id, highest_price):
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("UPDATE simulated_trades SET highest_price = ? WHERE id = ?", (highest_price, trade_id))
+                conn.commit()
+        except Exception as e:
+            logging.error(f"Error al actualizar highest_price para trade {trade_id}: {e}")
 
     def close_simulated_trade(self, trade_id, exit_price, profit_loss_usd, reason=""):
         try:
@@ -331,3 +360,29 @@ class Database:
         except Exception as e:
             logging.error(f"Error al recuperar parámetro adaptativo {name}: {e}")
             return default_value
+
+    # ---- MÉTODOS DE LISTA NEGRA (BLACKLIST) ----
+
+    def blacklist_contract(self, address, ticker, reason):
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT OR IGNORE INTO blacklist (contract_address, ticker, reason)
+                    VALUES (?, ?, ?)
+                """, (address, ticker, reason))
+                conn.commit()
+                return True
+        except Exception as e:
+            logging.error(f"Error al registrar contrato en la blacklist: {e}")
+            return False
+
+    def is_blacklisted(self, address):
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT 1 FROM blacklist WHERE contract_address = ?", (address,))
+                return cursor.fetchone() is not None
+        except Exception as e:
+            logging.error(f"Error al verificar blacklist para {address}: {e}")
+            return False

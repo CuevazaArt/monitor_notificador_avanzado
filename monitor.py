@@ -400,13 +400,17 @@ class ClearingHouse:
                 return True
         return False
 
-    async def evaluate_and_trade(self, session: aiohttp.ClientSession, ticker, contract_address, decision_info, current_price):
+    async def evaluate_and_trade(self, session: aiohttp.ClientSession, ticker, contract_address, decision_info, onchain_info):
         """
         Misión 3: Ejecución de trading automático de corto y mediano plazo.
         Toma decisiones autónomas de apertura sin intervención humana.
         """
         if decision_info["status"] == "REJECTED" or decision_info["recommendation"] == "BLOCKED":
             sys_log.info(f"Cámara de Compensación: Compra rechazada para {ticker}. Estado: {decision_info['status']}")
+            return
+
+        current_price = float(onchain_info.get("price_usd", 0.0)) if onchain_info else 0.0
+        if current_price <= 0.0:
             return
 
         # Intentar arbitraje primero si hay diferencial
@@ -429,6 +433,23 @@ class ClearingHouse:
         else:
             order_size_usd = base_order_size
 
+        # Cálculo de Deslizamiento (Slippage) estimado según liquidez
+        pool_liquidity = onchain_info.get("liquidity_usd", 0.0) if onchain_info else 0.0
+        if pool_liquidity > 0:
+            slippage_pct = (order_size_usd / pool_liquidity) * 100
+            if slippage_pct > 1.5:
+                # Escalar a la baja el tamaño de orden para fijar el slippage en 1.0% de la liquidez del pool
+                order_size_usd = pool_liquidity * 0.01
+                sys_log.warning(
+                    f"⚠️ Cámara de Compensación: Exposición reducida a ${order_size_usd:.2f} USD debido a deslizamiento estimado "
+                    f"alto ({slippage_pct:.2f}%) en pool de liquidez de ${pool_liquidity:,.2f} USD."
+                )
+
+        # Si el tamaño de la orden cae por debajo de $5 USD, abortar el trade por ineficiente
+        if order_size_usd < 5.0:
+            sys_log.info(f"Cámara de Compensación: Compra abortada para {ticker}. Exposición residual menor a $5 USD.")
+            return
+
         quantity = order_size_usd / current_price
         strategy = decision_info["recommendation"]
 
@@ -448,7 +469,7 @@ class ClearingHouse:
         )
 
     async def manage_open_positions(self, session: aiohttp.ClientSession, get_current_price_func):
-        """Monitorea posiciones y ejecuta salidas temporales usando parámetros adaptativos."""
+        """Monitorea posiciones y ejecuta salidas por tiempo o Trailing Stop-Loss."""
         open_trades = self.db.get_open_trades()
         if not open_trades:
             return
@@ -463,21 +484,38 @@ class ClearingHouse:
             entry_time = datetime.strptime(trade["timestamp_entry"], "%Y-%m-%d %H:%M:%S")
             elapsed_seconds = (datetime.utcnow() - entry_time).total_seconds()
             
-            # Pasar la sesión HTTP compartida para evitar fugas de sockets
+            # Pasar la sesión HTTP compartida
             current_price = await get_current_price_func(session, ticker)
             if not current_price:
                 current_price = trade["entry_price"]
 
+            # Obtener el precio más alto observado
+            highest_price = max(trade["highest_price"] or 0.0, trade["entry_price"], current_price)
+            if highest_price > (trade["highest_price"] or 0.0):
+                self.db.update_highest_price(trade_id, highest_price)
+
             should_close = False
             close_reason = ""
 
-            # Lógica de Salida
-            if strategy == "SHORT_ARB" and elapsed_seconds >= short_arb_hold:
+            # Cargar porcentaje de Trailing Stop-Loss adaptativo
+            if strategy == "SHORT_ARB":
+                stop_percent = float(self.db.get_adaptive_parameter("SHORT_ARB_TRAILING_STOP", "5.0"))
+            else:
+                stop_percent = float(self.db.get_adaptive_parameter("MID_TERM_TRAILING_STOP", "8.0"))
+
+            # 1. Comprobar si el precio cruzó a la baja el umbral de Trailing Stop-Loss
+            stop_threshold = highest_price * (1 - stop_percent / 100.0)
+            if current_price <= stop_threshold:
                 should_close = True
-                close_reason = f"Salida por límite de tiempo adaptativo ({short_arb_hold:.0f}s)."
+                close_reason = f"Salida por Trailing Stop-Loss adaptativo ({stop_percent:.1f}%). Umbral: ${stop_threshold:.6f}"
+            
+            # 2. Comprobar si excedió el tiempo máximo de retención de emergencia (fallback)
+            elif strategy == "SHORT_ARB" and elapsed_seconds >= short_arb_hold:
+                should_close = True
+                close_reason = f"Salida por límite de tiempo de emergencia ({short_arb_hold:.0f}s)."
             elif strategy == "MID_TERM" and elapsed_seconds >= mid_term_hold:
                 should_close = True
-                close_reason = f"Salida por límite de acumulación adaptativo ({mid_term_hold:.0f}s)."
+                close_reason = f"Salida por límite de acumulación de emergencia ({mid_term_hold:.0f}s)."
 
             if should_close:
                 token_balance = self.db.get_balance(ticker)
@@ -501,20 +539,45 @@ class ClearingHouse:
     def perform_self_critique(self, trade_id, ticker, strategy, profit_loss_usd):
         if profit_loss_usd > 0:
             critique = f"Trade {ticker} exitoso con estrategia {strategy}. Retorno neto positivo de ${profit_loss_usd:.2f} USD."
-            action = "Mantener parámetros actuales de la estrategia."
+            
+            # Si ganamos, relajamos levemente el Trailing Stop para dar aire a la volatilidad (hasta límites estándar)
+            if strategy == "SHORT_ARB":
+                curr_stop = float(self.db.get_adaptive_parameter("SHORT_ARB_TRAILING_STOP", "5.0"))
+                new_stop = min(5.0, curr_stop + 0.1)
+                self.db.update_adaptive_parameter("SHORT_ARB_TRAILING_STOP", new_stop)
+                action = f"Ajustar SHORT_ARB_TRAILING_STOP a {new_stop}% para mejorar captura de tendencia."
+            else:
+                curr_stop = float(self.db.get_adaptive_parameter("MID_TERM_TRAILING_STOP", "8.0"))
+                new_stop = min(8.0, curr_stop + 0.2)
+                self.db.update_adaptive_parameter("MID_TERM_TRAILING_STOP", new_stop)
+                action = f"Ajustar MID_TERM_TRAILING_STOP a {new_stop}%."
         else:
             critique = f"Trade {ticker} finalizado con pérdidas de ${profit_loss_usd:.2f} USD. La volatilidad o el tiempo de holding afectaron negativamente."
             
             if strategy == "SHORT_ARB":
+                # Reducir tiempo de hold
                 current_time = float(self.db.get_adaptive_parameter("SHORT_ARB_HOLD_SECONDS", "300"))
                 new_time = max(120.0, current_time - 30.0)
                 self.db.update_adaptive_parameter("SHORT_ARB_HOLD_SECONDS", new_time)
-                action = f"Ajustar SHORT_ARB_HOLD_SECONDS de {current_time}s a {new_time}s para mitigar pérdidas post-anuncio."
+                
+                # Ajustar Trailing Stop más ajustado para cortar pérdidas antes (min 2%)
+                curr_stop = float(self.db.get_adaptive_parameter("SHORT_ARB_TRAILING_STOP", "5.0"))
+                new_stop = max(2.0, curr_stop - 0.5)
+                self.db.update_adaptive_parameter("SHORT_ARB_TRAILING_STOP", new_stop)
+                
+                action = f"Reducir SHORT_ARB_HOLD_SECONDS a {new_time}s y SHORT_ARB_TRAILING_STOP a {new_stop}% para mitigar riesgo."
             else:
+                # Reducir tiempo de hold
                 current_time = float(self.db.get_adaptive_parameter("MID_TERM_HOLD_SECONDS", "259200"))
                 new_time = max(86400.0, current_time - 43200.0)
                 self.db.update_adaptive_parameter("MID_TERM_HOLD_SECONDS", new_time)
-                action = f"Ajustar MID_TERM_HOLD_SECONDS de {current_time}s a {new_time}s para acortar periodos de acumulación fallidos."
+                
+                # Ajustar Trailing Stop mediano plazo (min 3%)
+                curr_stop = float(self.db.get_adaptive_parameter("MID_TERM_TRAILING_STOP", "8.0"))
+                new_stop = max(3.0, curr_stop - 0.5)
+                self.db.update_adaptive_parameter("MID_TERM_TRAILING_STOP", new_stop)
+                
+                action = f"Reducir MID_TERM_HOLD_SECONDS a {new_time / 3600:.1f}h y MID_TERM_TRAILING_STOP a {new_stop}%."
 
         # Guardar en base de datos
         self.db.log_performance_critique(trade_id, ticker, profit_loss_usd, critique, action)
@@ -760,11 +823,22 @@ class ListingMonitor:
                         onchain_info = await self.check_onchain_status(session, ticker)
                         
                         contract_address = onchain_info["contract"] if onchain_info else "N/A"
+                        
+                        # Comprobación de Lista Negra (Blacklist)
+                        if contract_address != "N/A" and self.db.is_blacklisted(contract_address):
+                            sys_log.warning(f"🚫 [LISTA NEGRA] Contrato {contract_address} ({ticker}) ignorado por estar registrado como fraudulento.")
+                            return
+
                         decision_info = await self.decision_engine.evaluate_token(session, ticker, contract_address)
                         
+                        # Registro automático en Lista Negra si el contrato es rechazado por auditoría
+                        if contract_address != "N/A" and decision_info["status"] == "REJECTED":
+                            reason = "; ".join(decision_info["warnings"])
+                            self.db.blacklist_contract(contract_address, ticker, reason)
+                            sys_log.warning(f"🚫 [LISTA NEGRA] Contrato {contract_address} ({ticker}) agregado a la lista negra por auditoría fallida: {reason}")
+                        
                         if onchain_info and onchain_info["price_usd"] != "0.0":
-                            price = float(onchain_info["price_usd"])
-                            await self.clearing_house.evaluate_and_trade(session, ticker, contract_address, decision_info, price)
+                            await self.clearing_house.evaluate_and_trade(session, ticker, contract_address, decision_info, onchain_info)
                 
                 await self.send_notification(title, url, source, is_delisting, onchain_info, decision_info)
 
