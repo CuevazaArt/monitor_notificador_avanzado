@@ -1,6 +1,7 @@
 import os
 import time
 import logging
+import re
 import requests
 from datetime import datetime
 from dotenv import load_dotenv
@@ -162,13 +163,79 @@ class ListingMonitor:
         parts.append(f"{minutes}m")
         return " ".join(parts)
 
-    def send_notification(self, title, url, source, is_delisting=False):
+    def extract_ticker(self, title):
+        """Extrae el ticker/símbolo en mayúsculas de un título de anuncio."""
+        # 1. Buscar entre paréntesis: (TICKER)
+        match = re.search(r'\(([A-Z0-9]{2,10})\)', title)
+        if match:
+            return match.group(1)
+            
+        # 2. Buscar pares de trading comunes: TICKER/USDT
+        match = re.search(r'([A-Z0-9]{2,10})/USD', title)
+        if match:
+            return match.group(1)
+            
+        # 3. Buscar palabras en mayúsculas de 3 a 8 caracteres
+        words = re.findall(r'\b([A-Z0-9]{3,8})\b', title)
+        ignore_words = {
+            "SPOT", "USDT", "USDC", "USD", "EUR", "JPY", "LIST", "NEW", 
+            "CEX", "OKX", "BYBIT", "LAUNCH", "RWA", "VIP", "APR", "AI", "FUTURES"
+        }
+        for word in words:
+            if word not in ignore_words:
+                return word
+        return None
+
+    def check_onchain_status(self, ticker):
+        """Vigilancia On-chain: Consulta DexScreener para buscar pools de liquidez activos."""
+        url = f"https://api.dexscreener.com/latest/dex/search?q={ticker}"
+        try:
+            response = requests.get(url, headers=HEADERS, timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                pairs = data.get("pairs", [])
+                if not pairs:
+                    return None
+                
+                # Filtrar pares con liquidez informada
+                valid_pairs = [p for p in pairs if p.get("liquidity", {}).get("usd") is not None]
+                if not valid_pairs:
+                    return None
+                    
+                # Seleccionar el par con mayor liquidez
+                best_pair = max(valid_pairs, key=lambda p: p["liquidity"]["usd"])
+                base_token = best_pair.get("baseToken", {})
+                
+                return {
+                    "chain": best_pair.get("chainId", "desconocida").upper(),
+                    "dex": best_pair.get("dexId", "desconocido").upper(),
+                    "contract": base_token.get("address", "N/A"),
+                    "liquidity_usd": best_pair.get("liquidity", {}).get("usd", 0),
+                    "price_usd": best_pair.get("priceUsd", "0.0"),
+                    "pair_url": best_pair.get("url", "")
+                }
+        except Exception as e:
+            logging.error(f"Error en vigilancia on-chain (DexScreener) para {ticker}: {e}")
+        return None
+
+    def send_notification(self, title, url, source, is_delisting=False, onchain_info=None):
         emoji = "⚠️ [DESLISTADO]" if is_delisting else "🚀 [LISTADO]"
         message = (
             f"{emoji} **Nuevo Anuncio Detectado en {source}**\n\n"
             f"**Título:** {title}\n"
             f"**Enlace:** {url}"
         )
+        
+        if onchain_info:
+            message += (
+                f"\n\n🌐 **Vigilancia On-Chain (Confirmación):**\n"
+                f"• Red / DEX: {onchain_info['chain']} / {onchain_info['dex']}\n"
+                f"• Dirección de Contrato: `{onchain_info['contract']}`\n"
+                f"• Liquidez del Pool: ${onchain_info['liquidity_usd']:,.2f} USD\n"
+                f"• Precio Actual: ${onchain_info['price_usd']} USD\n"
+                f"• Gráfico en tiempo real: [DexScreener]({onchain_info['pair_url']})"
+            )
+            
         self._dispatch_message(message)
 
     def send_heartbeat_report(self):
@@ -247,11 +314,20 @@ class ListingMonitor:
             is_new = self.db.log_alert(source, code, title, url, is_delisting)
             if is_new:
                 logging.warning(f"¡NUEVA ALERTA REGISTRADA ({source})! {title}")
-                self.send_notification(title, url, source, is_delisting)
+                
+                # Vigilancia On-Chain para confirmar eventos y actividades de listados
+                onchain_info = None
+                if is_listing:
+                    ticker = self.extract_ticker(title)
+                    if ticker:
+                        logging.info(f"Ticker detectado ({ticker}). Buscando pools on-chain...")
+                        onchain_info = self.check_onchain_status(ticker)
+                
+                self.send_notification(title, url, source, is_delisting, onchain_info)
 
     def run(self):
         logging.info("Inicializando bases de datos y cargando estado histórico...")
-        self.db.log_system("SYSTEM", "Monitor iniciado en modo 24/7 continuo y agnóstico de fuentes.")
+        self.db.log_system("SYSTEM", "Monitor iniciado en modo 24/7 continuo y con vigilancia on-chain.")
         
         # Carga inicial silenciosa
         for source in self.sources:
@@ -260,12 +336,12 @@ class ListingMonitor:
             except Exception:
                 pass
         
-        startup_msg = "🟢 *[SISTEMA] Monitor de CEXs iniciado y operando en modo continuo 24/7.*"
+        startup_msg = "🟢 *[SISTEMA] Monitor de CEXs iniciado, operando 24/7 y con vigilancia on-chain activa.*"
         self._dispatch_message(startup_msg, is_heartbeat=True)
         logging.info("Arranque exitoso. Escaneando fuentes cada %d segundos...", POLLING_INTERVAL)
         
         while True:
-            # Procesar cada fuente de forma agnóstica y con medición individual de latencia
+            # Procesar cada fuente de forma agnóstica
             for source in self.sources:
                 start = time.time()
                 try:
