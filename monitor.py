@@ -25,11 +25,6 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 HEARTBEAT_INTERVAL_HOURS = float(os.getenv("HEARTBEAT_INTERVAL_HOURS", 12))
 
-# APIs de Anuncios
-BINANCE_API = "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"
-BYBIT_API = "https://api.bybit.com/v5/announcements/index"
-OKX_API = "https://www.okx.com/api/v5/support/announcements"
-
 # Encabezados HTTP comunes para evitar bloqueos
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -37,11 +32,121 @@ HEADERS = {
     "lang": "en"
 }
 
+# =====================================================================
+# CLASES BASE Y FUENTES DE DATOS (ARQUITECTURA AGNÓSTICA)
+# =====================================================================
+
+class BaseSource:
+    """Clase base abstracta para definir cualquier fuente de anuncios o datos."""
+    def __init__(self, name):
+        self.name = name
+
+    def fetch_announcements(self):
+        """
+        Debe consultar la fuente y devolver una lista de diccionarios con el formato:
+        [
+            {"title": str, "code": str, "url": str},
+            ...
+        ]
+        """
+        raise NotImplementedError
+
+
+class BinanceSource(BaseSource):
+    def __init__(self):
+        super().__init__("Binance")
+        self.api_url = "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"
+
+    def fetch_announcements(self):
+        params = {
+            "type": 1,
+            "catalogId": 48,  # ID 48: Nuevos listados
+            "pageNo": 1,
+            "pageSize": 5
+        }
+        response = requests.get(self.api_url, params=params, headers=HEADERS, timeout=5)
+        articles = []
+        if response.status_code == 200:
+            data = response.json()
+            items = data.get("data", {}).get("catalogs", [{}])[0].get("articles", [])
+            for item in items:
+                articles.append({
+                    "title": item.get("title"),
+                    "code": str(item.get("code")),
+                    "url": f"https://www.binance.com/en/support/announcement/{item.get('code')}"
+                })
+        else:
+            raise requests.exceptions.HTTPError(f"HTTP {response.status_code}")
+        return articles
+
+
+class BybitSource(BaseSource):
+    def __init__(self):
+        super().__init__("Bybit")
+        self.api_url = "https://api.bybit.com/v5/announcements/index"
+
+    def fetch_announcements(self):
+        params = {
+            "locale": "en-US",
+            "limit": 5
+        }
+        response = requests.get(self.api_url, params=params, headers=HEADERS, timeout=5)
+        articles = []
+        if response.status_code == 200:
+            data = response.json()
+            items = data.get("result", {}).get("list", [])
+            for item in items:
+                url = item.get("url")
+                code = url.strip("/").split("/")[-1] if url else None
+                articles.append({
+                    "title": item.get("title"),
+                    "code": code,
+                    "url": url
+                })
+        else:
+            raise requests.exceptions.HTTPError(f"HTTP {response.status_code}")
+        return articles
+
+
+class OKXSource(BaseSource):
+    def __init__(self):
+        super().__init__("OKX")
+        self.api_url = "https://www.okx.com/api/v5/support/announcements"
+
+    def fetch_announcements(self):
+        response = requests.get(self.api_url, headers=HEADERS, timeout=5)
+        articles = []
+        if response.status_code == 200:
+            data = response.json()
+            details = data.get("data", [{}])[0].get("details", [])
+            for item in details:
+                url = item.get("url")
+                code = url.strip("/").split("/")[-1] if url else None
+                articles.append({
+                    "title": item.get("title"),
+                    "code": code,
+                    "url": url
+                })
+        else:
+            raise requests.exceptions.HTTPError(f"HTTP {response.status_code}")
+        return articles
+
+# =====================================================================
+# MOTOR PRINCIPAL DEL MONITOR
+# =====================================================================
+
 class ListingMonitor:
     def __init__(self):
         self.db = Database()
         self.start_time = time.time()
         self.last_heartbeat_time = time.time()
+        
+        # Lista agnóstica de fuentes de datos activas
+        self.sources = [
+            BinanceSource(),
+            BybitSource(),
+            OKXSource()
+        ]
 
     def get_uptime_str(self):
         uptime_seconds = int(time.time() - self.start_time)
@@ -69,12 +174,11 @@ class ListingMonitor:
     def send_heartbeat_report(self):
         logging.info("Compilando y enviando reporte de control (heartbeat) a Telegram...")
         
-        # Obtener métricas de la base de datos
         summary = self.db.get_metrics_summary(hours=HEARTBEAT_INTERVAL_HOURS)
         total_alerts = self.db.get_total_alerts_count(hours=HEARTBEAT_INTERVAL_HOURS)
         uptime = self.get_uptime_str()
         
-        # Determinar estado de salud
+        # Determinar estado de salud del sistema
         system_status = "🟢 OK"
         failed_sources = []
         for src, metrics in summary.items():
@@ -106,7 +210,6 @@ class ListingMonitor:
         self._dispatch_message(message, is_heartbeat=True)
 
     def _dispatch_message(self, message, is_heartbeat=False):
-        # Enviar a Discord (Solo alertas reales)
         if DISCORD_WEBHOOK_URL and not is_heartbeat:
             try:
                 requests.post(DISCORD_WEBHOOK_URL, json={"content": message}, timeout=5)
@@ -115,13 +218,12 @@ class ListingMonitor:
                 logging.error(f"Error al enviar notificación a Discord: {e}")
                 self.db.log_system("ERROR", f"Fallo al notificar Discord: {e}")
                 
-        # Enviar a Telegram (Alertas y Heartbeats)
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
             try:
                 telegram_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                 payload = {
                     "chat_id": TELEGRAM_CHAT_ID,
-                    "text": message.replace("**", "*"), # Convertir formato negrita si se usa Markdown
+                    "text": message.replace("**", "*"),
                     "parse_mode": "Markdown"
                 }
                 requests.post(telegram_url, json=payload, timeout=5)
@@ -135,7 +237,6 @@ class ListingMonitor:
             return
             
         title_lower = title.lower()
-        # Palabras clave de listado/deslistado
         keywords_list = ["will list", "lists", "introduce", "launch", "listará", "presenta"]
         keywords_delist = ["will delist", "delisting", "deslistará", "removerá", "delist"]
         
@@ -143,116 +244,43 @@ class ListingMonitor:
         is_listing = any(kw in title_lower for kw in keywords_list)
         
         if is_listing or is_delisting:
-            # Intentar registrar en base de datos.
-            # Solo enviamos notificación si el registro es exitoso (nueva alerta única)
             is_new = self.db.log_alert(source, code, title, url, is_delisting)
             if is_new:
                 logging.warning(f"¡NUEVA ALERTA REGISTRADA ({source})! {title}")
                 self.send_notification(title, url, source, is_delisting)
 
-    def monitor_binance(self):
-        start = time.time()
-        try:
-            params = {
-                "type": 1,
-                "catalogId": 48,  # ID 48: Nuevos listados
-                "pageNo": 1,
-                "pageSize": 5
-            }
-            response = requests.get(BINANCE_API, params=params, headers=HEADERS, timeout=5)
-            latency = (time.time() - start) * 1000
-            
-            if response.status_code == 200:
-                self.db.log_api_metric("Binance", latency, 200)
-                data = response.json()
-                articles = data.get("data", {}).get("catalogs", [{}])[0].get("articles", [])
-                for art in articles:
-                    title = art.get("title")
-                    code = art.get("code")
-                    url = f"https://www.binance.com/en/support/announcement/{code}"
-                    self.parse_and_check(title, str(code), url, "Binance")
-            else:
-                self.db.log_api_metric("Binance", latency, response.status_code, f"Status code: {response.status_code}")
-                logging.error(f"Binance API devolvió código: {response.status_code}")
-        except Exception as e:
-            latency = (time.time() - start) * 1000
-            self.db.log_api_metric("Binance", latency, 0, str(e))
-            self.db.log_system("ERROR", f"Error de red en Binance: {e}")
-            logging.error(f"Excepción monitoreando Binance: {e}")
-
-    def monitor_bybit(self):
-        start = time.time()
-        try:
-            params = {
-                "locale": "en-US",
-                "limit": 5
-            }
-            response = requests.get(BYBIT_API, params=params, headers=HEADERS, timeout=5)
-            latency = (time.time() - start) * 1000
-            
-            if response.status_code == 200:
-                self.db.log_api_metric("Bybit", latency, 200)
-                data = response.json()
-                articles = data.get("result", {}).get("list", [])
-                for art in articles:
-                    title = art.get("title")
-                    url = art.get("url")
-                    code = url.strip("/").split("/")[-1] if url else None
-                    self.parse_and_check(title, code, url, "Bybit")
-            else:
-                self.db.log_api_metric("Bybit", latency, response.status_code, f"Status code: {response.status_code}")
-                logging.error(f"Bybit API devolvió código: {response.status_code}")
-        except Exception as e:
-            latency = (time.time() - start) * 1000
-            self.db.log_api_metric("Bybit", latency, 0, str(e))
-            self.db.log_system("ERROR", f"Error de red en Bybit: {e}")
-            logging.error(f"Excepción monitoreando Bybit: {e}")
-
-    def monitor_okx(self):
-        start = time.time()
-        try:
-            response = requests.get(OKX_API, headers=HEADERS, timeout=5)
-            latency = (time.time() - start) * 1000
-            
-            if response.status_code == 200:
-                self.db.log_api_metric("OKX", latency, 200)
-                data = response.json()
-                details = data.get("data", [{}])[0].get("details", [])
-                for art in details:
-                    title = art.get("title")
-                    url = art.get("url")
-                    code = url.strip("/").split("/")[-1] if url else None
-                    self.parse_and_check(title, code, url, "OKX")
-            else:
-                self.db.log_api_metric("OKX", latency, response.status_code, f"Status code: {response.status_code}")
-                logging.error(f"OKX API devolvió código: {response.status_code}")
-        except Exception as e:
-            latency = (time.time() - start) * 1000
-            self.db.log_api_metric("OKX", latency, 0, str(e))
-            self.db.log_system("ERROR", f"Error de red en OKX: {e}")
-            logging.error(f"Excepción monitoreando OKX: {e}")
-
     def run(self):
         logging.info("Inicializando bases de datos y cargando estado histórico...")
-        self.db.log_system("SYSTEM", "Monitor iniciado en modo 24/7 continuo.")
+        self.db.log_system("SYSTEM", "Monitor iniciado en modo 24/7 continuo y agnóstico de fuentes.")
         
-        # Carga inicial silenciosa de anuncios existentes para evitar duplicar alertas en el primer ciclo
-        self.monitor_binance()
-        self.monitor_bybit()
-        self.monitor_okx()
+        # Carga inicial silenciosa
+        for source in self.sources:
+            try:
+                source.fetch_announcements()
+            except Exception:
+                pass
         
-        # Enviar mensaje de confirmación de arranque
         startup_msg = "🟢 *[SISTEMA] Monitor de CEXs iniciado y operando en modo continuo 24/7.*"
         self._dispatch_message(startup_msg, is_heartbeat=True)
         logging.info("Arranque exitoso. Escaneando fuentes cada %d segundos...", POLLING_INTERVAL)
         
         while True:
-            # Monitoreo de APIs con manejo interno de excepciones
-            self.monitor_binance()
-            self.monitor_bybit()
-            self.monitor_okx()
+            # Procesar cada fuente de forma agnóstica y con medición individual de latencia
+            for source in self.sources:
+                start = time.time()
+                try:
+                    articles = source.fetch_announcements()
+                    latency = (time.time() - start) * 1000
+                    self.db.log_api_metric(source.name, latency, 200)
+                    for art in articles:
+                        self.parse_and_check(art["title"], art["code"], art["url"], source.name)
+                except Exception as e:
+                    latency = (time.time() - start) * 1000
+                    self.db.log_api_metric(source.name, latency, 0, str(e))
+                    self.db.log_system("ERROR", f"Error monitoreando {source.name}: {e}")
+                    logging.error(f"Excepción en fuente {source.name}: {e}")
             
-            # Verificar si corresponde enviar el reporte de control periódico (heartbeat)
+            # Control periódico de salud (heartbeat)
             current_time = time.time()
             if current_time - self.last_heartbeat_time >= HEARTBEAT_INTERVAL_HOURS * 3600:
                 try:
