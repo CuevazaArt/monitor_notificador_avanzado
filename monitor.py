@@ -185,7 +185,6 @@ class DecisionEngine:
             "recommendation": "SHORT_ARB"  # SHORT_ARB o MID_TERM
         }
 
-        # Ejecutamos las validaciones en paralelo
         tasks = []
         
         if self.cq_key and self.cq_key != "YOUR_KEY":
@@ -204,14 +203,13 @@ class DecisionEngine:
                     if task_res.get("status") == "WARNING":
                         results["status"] = "WARNING"
 
-        # Lógica de Selección de Estrategia (Arbitraje vs. Acumulación Mediano Plazo)
         holders_count = results["metrics"].get("Dune Unique Holders", "0")
         try:
             holders_num = int(re.sub(r'\D', '', str(holders_count)))
         except ValueError:
             holders_num = 0
 
-        # Criterio adaptativo para mediano plazo: holders altos y sin advertencias críticas
+        # Criterio adaptativo
         if holders_num >= 1000 and results["status"] == "APPROVED":
             results["recommendation"] = "MID_TERM"
             
@@ -277,28 +275,25 @@ class ClearingHouse:
         self.db = db
         self.db.init_portfolio_balance(SIMULATED_BUDGET)
 
-    async def execute_local_arbitrage(self, ticker, entry_price_dex, target_exchange="Binance"):
+    async def execute_local_arbitrage(self, session: aiohttp.ClientSession, ticker, entry_price_dex, target_exchange="Binance"):
         """
         Misión 2: Simulación local de arbitraje de alta frecuencia a demanda.
         Compara precio DEX vs CEX y ejecuta compra/venta instantánea si hay diferencial.
         """
-        # Simulamos que en el CEX de destino cotizará con una prima del 5% al abrir
         cex_target_price = entry_price_dex * 1.05
         spread = cex_target_price - entry_price_dex
         spread_pct = (spread / entry_price_dex) * 100
 
-        if spread_pct > 2.0:  # Umbral de arbitraje
+        if spread_pct > 2.0:
             usd_balance = self.db.get_balance("USD")
             if usd_balance >= 50.0:
                 trade_size_usd = 50.0
                 qty = trade_size_usd / entry_price_dex
                 
-                # Ejecutar el arbitraje instantáneo
                 gross_profit = (cex_target_price - entry_price_dex) * qty
-                fee = trade_size_usd * 0.001 * 2  # 0.1% de comisión de compra y venta
+                fee = trade_size_usd * 0.001 * 2
                 net_profit = gross_profit - fee
                 
-                # Actualizar base de datos
                 self.db.update_balance("USD", usd_balance + net_profit)
                 trade_id = self.db.open_simulated_trade(
                     ticker, "SHORT_ARB", entry_price_dex, qty, 
@@ -312,15 +307,14 @@ class ClearingHouse:
                 alert_log.warning(
                     f"⚡ [ARBITRAJE EJECUTADO] {ticker} | Spread: {spread_pct:.2f}% | "
                     f"Compra DEX: ${entry_price_dex:.6f} | Venta CEX: ${cex_target_price:.6f} | "
-                    f"Retorno Neto: +${net_profit:.2f} USD (Comisiones deducidas)"
+                    f"Retorno Neto: +${net_profit:.2f} USD"
                 )
                 
-                # Autocrítica inmediata
                 self.perform_self_critique(trade_id, ticker, "SHORT_ARB", net_profit)
                 return True
         return False
 
-    async def evaluate_and_trade(self, ticker, contract_address, decision_info, current_price):
+    async def evaluate_and_trade(self, session: aiohttp.ClientSession, ticker, contract_address, decision_info, current_price):
         """
         Misión 3: Ejecución de trading automático de corto y mediano plazo.
         Toma decisiones autónomas de apertura sin intervención humana.
@@ -330,11 +324,10 @@ class ClearingHouse:
             return
 
         # Intentar arbitraje primero si hay diferencial
-        arb_executed = await self.execute_local_arbitrage(ticker, current_price)
+        arb_executed = await self.execute_local_arbitrage(session, ticker, current_price)
         if arb_executed:
-            return  # Si ya se ejecutó un arbitraje instantáneo exitoso, omitir trade normal
+            return
 
-        # Comprar para holding regular (Short Arb de tiempo o Mid Term)
         usd_balance = self.db.get_balance("USD")
         if usd_balance < 10.0:
             sys_log.info(f"Cámara de Compensación: Saldo insuficiente (${usd_balance:.2f} USD).")
@@ -359,13 +352,12 @@ class ClearingHouse:
             f"Precio Entrada: ${current_price:.6f} | Estrategia: {strategy} | ID Trade: {trade_id}"
         )
 
-    async def manage_open_positions(self, get_current_price_func):
+    async def manage_open_positions(self, session: aiohttp.ClientSession, get_current_price_func):
         """Monitorea posiciones y ejecuta salidas temporales usando parámetros adaptativos."""
         open_trades = self.db.get_open_trades()
         if not open_trades:
             return
 
-        # Recuperar parámetros adaptativos de la base de datos (Autoaprendizaje)
         short_arb_hold = float(self.db.get_adaptive_parameter("SHORT_ARB_HOLD_SECONDS", "300"))
         mid_term_hold = float(self.db.get_adaptive_parameter("MID_TERM_HOLD_SECONDS", "259200"))
 
@@ -376,7 +368,8 @@ class ClearingHouse:
             entry_time = datetime.strptime(trade["timestamp_entry"], "%Y-%m-%d %H:%M:%S")
             elapsed_seconds = (datetime.utcnow() - entry_time).total_seconds()
             
-            current_price = await get_current_price_func(ticker)
+            # Pasar la sesión HTTP compartida para evitar fugas de sockets
+            current_price = await get_current_price_func(session, ticker)
             if not current_price:
                 current_price = trade["entry_price"]
 
@@ -408,14 +401,9 @@ class ClearingHouse:
                     f"Precio Salida: ${current_price:.6f} | PnL: ${pnl:+.2f} USD | Razón: {close_reason}"
                 )
 
-                # Ejecutar autocrítica y autoaprendizaje
                 self.perform_self_critique(trade_id, ticker, strategy, pnl)
 
     def perform_self_critique(self, trade_id, ticker, strategy, profit_loss_usd):
-        """
-        Misión 3 (Autocrítica y aprendizaje): Analiza el desempeño del trade,
-        ajusta los parámetros adaptativos de forma automática y los guarda en la DB.
-        """
         if profit_loss_usd > 0:
             critique = f"Trade {ticker} exitoso con estrategia {strategy}. Retorno neto positivo de ${profit_loss_usd:.2f} USD."
             action = "Mantener parámetros actuales de la estrategia."
@@ -424,13 +412,11 @@ class ClearingHouse:
             
             if strategy == "SHORT_ARB":
                 current_time = float(self.db.get_adaptive_parameter("SHORT_ARB_HOLD_SECONDS", "300"))
-                # Reducimos el tiempo de retención para salir antes si hay pérdidas (min 120 segundos)
                 new_time = max(120.0, current_time - 30.0)
                 self.db.update_adaptive_parameter("SHORT_ARB_HOLD_SECONDS", new_time)
                 action = f"Ajustar SHORT_ARB_HOLD_SECONDS de {current_time}s a {new_time}s para mitigar pérdidas post-anuncio."
             else:
                 current_time = float(self.db.get_adaptive_parameter("MID_TERM_HOLD_SECONDS", "259200"))
-                # Reducimos la exposición a mediano plazo ante pérdidas (min 1 día)
                 new_time = max(86400.0, current_time - 43200.0)
                 self.db.update_adaptive_parameter("MID_TERM_HOLD_SECONDS", new_time)
                 action = f"Ajustar MID_TERM_HOLD_SECONDS de {current_time}s a {new_time}s para acortar periodos de acumulación fallidos."
@@ -491,19 +477,18 @@ class ListingMonitor:
                 return word
         return None
 
-    async def get_token_price_onchain(self, ticker):
-        """Obtiene el precio del par más líquido en DexScreener de forma asíncrona."""
+    async def get_token_price_onchain(self, session: aiohttp.ClientSession, ticker):
+        """Obtiene el precio del par más líquido en DexScreener utilizando la sesión compartida."""
         url = f"https://api.dexscreener.com/latest/dex/search?q={ticker}"
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=HEADERS, timeout=5) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        pairs = data.get("pairs", [])
-                        valid_pairs = [p for p in pairs if p.get("liquidity", {}).get("usd") is not None]
-                        if valid_pairs:
-                            best_pair = max(valid_pairs, key=lambda p: p["liquidity"]["usd"])
-                            return float(best_pair.get("priceUsd", 0.0))
+            async with session.get(url, headers=HEADERS, timeout=5) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    pairs = data.get("pairs", [])
+                    valid_pairs = [p for p in pairs if p.get("liquidity", {}).get("usd") is not None]
+                    if valid_pairs:
+                        best_pair = max(valid_pairs, key=lambda p: p["liquidity"]["usd"])
+                        return float(best_pair.get("priceUsd", 0.0))
         except Exception:
             pass
         return None
@@ -545,7 +530,6 @@ class ListingMonitor:
             f"**Enlace:** {url}"
         )
         
-        # Misión 1: Señales acompañadas con acciones sugeridas específicas
         if is_delisting:
             action_text = f"🛑 [ACCIÓN RECOMENDADA]: VENDER de inmediato para cortar pérdidas. Si tienes un bot de arbitraje o trading para {source}, apágalo ahora mismo."
         else:
@@ -593,7 +577,6 @@ class ListingMonitor:
         usd_balance = self.db.get_balance("USD")
         trade_summary = self.db.get_trading_summary()
         
-        # Recuperar tiempos adaptativos (autoaprendizaje) para el informe
         short_arb_hold = float(self.db.get_adaptive_parameter("SHORT_ARB_HOLD_SECONDS", "300"))
         mid_term_hold = float(self.db.get_adaptive_parameter("MID_TERM_HOLD_SECONDS", "259200"))
         
@@ -686,7 +669,7 @@ class ListingMonitor:
                         
                         if onchain_info and onchain_info["price_usd"] != "0.0":
                             price = float(onchain_info["price_usd"])
-                            await self.clearing_house.evaluate_and_trade(ticker, contract_address, decision_info, price)
+                            await self.clearing_house.evaluate_and_trade(session, ticker, contract_address, decision_info, price)
                 
                 await self.send_notification(title, url, source, is_delisting, onchain_info, decision_info)
 
@@ -720,8 +703,8 @@ class ListingMonitor:
                 tasks = [self.monitor_source_task(session, src) for src in self.sources]
                 await asyncio.gather(*tasks)
                 
-                # Gestionar órdenes de la Cámara de Compensación
-                await self.clearing_house.manage_open_positions(self.get_token_price_onchain)
+                # Pasar la sesión única al gestor de posiciones abiertas
+                await self.clearing_house.manage_open_positions(session, self.get_token_price_onchain)
                 
                 current_time = time.time()
                 if current_time - self.last_heartbeat_time >= HEARTBEAT_INTERVAL_HOURS * 3600:
