@@ -182,67 +182,153 @@ class DecisionEngine:
             "status": "APPROVED",
             "warnings": [],
             "metrics": {},
-            "recommendation": "SHORT_ARB"  # SHORT_ARB o MID_TERM
+            "recommendation": "SHORT_ARB"  # SHORT_ARB, MID_TERM, o BLOCKED
         }
 
         tasks = []
         
-        if self.cq_key and self.cq_key != "YOUR_KEY":
-            tasks.append(self._validate_cryptoquant(session))
-        if self.dune_key and self.dune_key != "YOUR_KEY":
-            tasks.append(self._validate_dune(session))
-        if self.moralis_key and self.moralis_key != "YOUR_KEY" and contract_address != "N/A":
+        # 1. CryptoQuant - Presión macro de venta en exchanges
+        tasks.append(self._validate_cryptoquant(session))
+        
+        # 2. Dune - Distribución de holders y volumen
+        tasks.append(self._validate_dune(session, contract_address))
+        
+        # 3. Moralis - Metadatos y seguridad del contrato
+        if contract_address != "N/A":
             tasks.append(self._validate_moralis(session, ticker, contract_address))
 
-        if tasks:
-            completed_tasks = await asyncio.gather(*tasks, return_exceptions=True)
-            for task_res in completed_tasks:
-                if isinstance(task_res, dict):
-                    results["warnings"].extend(task_res.get("warnings", []))
-                    results["metrics"].update(task_res.get("metrics", {}))
-                    if task_res.get("status") == "WARNING":
-                        results["status"] = "WARNING"
+        completed_tasks = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for task_res in completed_tasks:
+            if isinstance(task_res, dict):
+                results["warnings"].extend(task_res.get("warnings", []))
+                results["metrics"].update(task_res.get("metrics", {}))
+                # El estado más restrictivo prevalece: REJECTED > WARNING > APPROVED
+                if task_res.get("status") == "REJECTED":
+                    results["status"] = "REJECTED"
+                elif task_res.get("status") == "WARNING" and results["status"] != "REJECTED":
+                    results["status"] = "WARNING"
 
-        holders_count = results["metrics"].get("Dune Unique Holders", "0")
-        try:
-            holders_num = int(re.sub(r'\D', '', str(holders_count)))
-        except ValueError:
-            holders_num = 0
+        # Lógica de decisión cruzada y selección de estrategia
+        if results["status"] == "REJECTED":
+            results["recommendation"] = "BLOCKED"
+            return results
 
-        # Criterio adaptativo
-        if holders_num >= 1000 and results["status"] == "APPROVED":
+        # Comprobar volumen y concentración de holders de Dune
+        holders_count = results["metrics"].get("Dune Unique Holders", 0)
+        whale_conc = results["metrics"].get("Dune Top 10 Concentration %", 0.0)
+        
+        # Criterio adaptativo:
+        # Si tiene buena base de holders (>1000) y baja concentración de ballenas (<75%), se acumula a mediano plazo
+        if holders_count >= 1000 and whale_conc < 75.0 and results["status"] == "APPROVED":
             results["recommendation"] = "MID_TERM"
-            
+        else:
+            results["recommendation"] = "SHORT_ARB" # Scalping rápido si hay ballenas o advertencias
+
         return results
 
     async def _validate_cryptoquant(self, session: aiohttp.ClientSession):
         res = {"status": "APPROVED", "warnings": [], "metrics": {}}
+        
+        # Si no hay key, simulamos un flujo normal (o con variables aleatorias para demostración)
+        if not self.cq_key or self.cq_key == "YOUR_KEY":
+            import random
+            inflow_mean = random.choice([0.4, 0.8, 1.6, 2.7])
+            res["metrics"]["CQ Whale Inflow Mean"] = inflow_mean
+            
+            if inflow_mean > 2.5:
+                res["status"] = "REJECTED"
+                res["warnings"].append(f"🔴 CryptoQuant: Depósitos de ballenas críticos ({inflow_mean}). Presión bajista extrema.")
+            elif inflow_mean > 1.2:
+                res["status"] = "WARNING"
+                res["warnings"].append(f"🟡 CryptoQuant: Entrada de ballenas elevada ({inflow_mean}). Presión de venta.")
+            return res
+            
         url = "https://api.cryptoquant.com/v1/btc/exchange-flows/inflow?window=day&limit=1"
         headers = {"Authorization": f"Bearer {self.cq_key}"}
         try:
             async with session.get(url, headers=headers, timeout=5) as response:
                 if response.status == 200:
-                    res["metrics"]["CryptoQuant Inflow State"] = "Normal"
+                    data = await response.json()
+                    inflow_mean = float(data.get("data", [{}])[0].get("inflow_mean", 0.8))
+                    res["metrics"]["CQ Whale Inflow Mean"] = inflow_mean
+                    if inflow_mean > 2.5:
+                        res["status"] = "REJECTED"
+                        res["warnings"].append(f"🔴 CryptoQuant: Tasa de entrada crítica ({inflow_mean}).")
+                    elif inflow_mean > 1.2:
+                        res["status"] = "WARNING"
+                        res["warnings"].append(f"🟡 CryptoQuant: Tasa de entrada elevada ({inflow_mean}).")
                 else:
-                    res["warnings"].append(f"CryptoQuant retornó HTTP {response.status}")
+                    res["warnings"].append(f"CryptoQuant: API retornó HTTP {response.status}")
         except Exception as e:
-            err_log.error(f"Excepción en CryptoQuant: {e}")
-            res["warnings"].append(f"CryptoQuant: Fallo de conexión")
+            err_log.error(f"Error en CryptoQuant API: {e}")
+            res["warnings"].append("CryptoQuant: Fallo de conexión")
         return res
 
-    async def _validate_dune(self, session: aiohttp.ClientSession):
-        await asyncio.sleep(0.1)
-        return {
-            "status": "APPROVED",
-            "warnings": [],
-            "metrics": {
-                "Dune Weekly Volume": "$1.52M USD",
-                "Dune Unique Holders": "1,450 addresses"
-            }
-        }
+    async def _validate_dune(self, session: aiohttp.ClientSession, contract_address):
+        res = {"status": "APPROVED", "warnings": [], "metrics": {}}
+        
+        if not self.dune_key or self.dune_key == "YOUR_KEY":
+            import random
+            holders = random.choice([450, 1200, 3500])
+            whale_conc = random.choice([35.5, 68.0, 82.5, 96.0])
+            
+            res["metrics"]["Dune Unique Holders"] = holders
+            res["metrics"]["Dune Top 10 Concentration %"] = whale_conc
+            res["metrics"]["Dune Weekly Volume"] = "$840,000 USD"
+            
+            if whale_conc > 95.0:
+                res["status"] = "REJECTED"
+                res["warnings"].append(f"🔴 Dune: Distribución centralizada extrema (Top 10 holds {whale_conc}%). Rugpull risk.")
+            elif whale_conc > 80.0:
+                res["status"] = "WARNING"
+                res["warnings"].append(f"🟡 Dune: Concentración de ballenas alta (Top 10 holds {whale_conc}%). Dump risk.")
+            return res
+
+        query_id = 123456  
+        url = f"https://api.dune.com/api/v1/query/{query_id}/results"
+        headers = {"X-Dune-API-Key": self.dune_key}
+        try:
+            async with session.get(url, headers=headers, timeout=5) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    rows = data.get("result", {}).get("rows", [])
+                    if rows:
+                        holders = int(rows[0].get("unique_holders", 1200))
+                        whale_conc = float(rows[0].get("top_10_percent", 55.0))
+                        res["metrics"]["Dune Unique Holders"] = holders
+                        res["metrics"]["Dune Top 10 Concentration %"] = whale_conc
+                        
+                        if whale_conc > 95.0:
+                            res["status"] = "REJECTED"
+                            res["warnings"].append("🔴 Dune: Centralización crítica de tokens en top 10 wallets.")
+                        elif whale_conc > 80.0:
+                            res["status"] = "WARNING"
+                            res["warnings"].append("🟡 Dune: Alta concentración de ballenas.")
+                else:
+                    res["warnings"].append(f"Dune: API retornó HTTP {response.status}")
+        except Exception as e:
+            err_log.error(f"Error en Dune API: {e}")
+            res["warnings"].append("Dune: Fallo de conexión")
+        return res
 
     async def _validate_moralis(self, session: aiohttp.ClientSession, ticker, contract_address):
         res = {"status": "APPROVED", "warnings": [], "metrics": {}}
+        
+        if not self.moralis_key or self.moralis_key == "YOUR_KEY":
+            import random
+            tax_rate = random.choice([0.0, 1.5, 4.5, 12.0])
+            res["metrics"]["Moralis Sell Tax %"] = tax_rate
+            res["metrics"]["Moralis verified contract"] = True
+            
+            if tax_rate > 5.0:
+                res["status"] = "REJECTED"
+                res["warnings"].append(f"🔴 Moralis: Tarifa de transferencia en blockchain muy alta ({tax_rate}%). Posible Honeypot.")
+            elif tax_rate > 2.0:
+                res["status"] = "WARNING"
+                res["warnings"].append(f"🟡 Moralis: Impuesto de transferencia del {tax_rate}% detectado.")
+            return res
+
         url = f"https://deep-index.moralis.io/api/v2.2/erc20/metadata?addresses%5B%5D={contract_address}"
         headers = {
             "accept": "application/json",
@@ -257,13 +343,13 @@ class DecisionEngine:
                         res["metrics"]["Moralis Name"] = token_meta.get("name", "N/A")
                         res["metrics"]["Moralis Symbol"] = token_meta.get("symbol", "N/A")
                         if token_meta.get("symbol", "").upper() != ticker.upper():
-                            res["warnings"].append("⚠️ Moralis: Símbolos incongruentes entre CEX y cadena.")
-                            res["status"] = "WARNING"
+                            res["status"] = "REJECTED"
+                            res["warnings"].append("🔴 Moralis: ¡ALERTA SÍMBOLO PHISHING! Símbolo on-chain no coincide con anuncio CEX.")
                 else:
-                    res["warnings"].append(f"Moralis retornó HTTP {response.status}")
+                    res["warnings"].append(f"Moralis: API retornó HTTP {response.status}")
         except Exception as e:
-            err_log.error(f"Excepción en Moralis: {e}")
-            res["warnings"].append(f"Moralis: Fallo de conexión")
+            err_log.error(f"Error en Moralis API: {e}")
+            res["warnings"].append("Moralis: Fallo de conexión")
         return res
 
 # =====================================================================
@@ -319,8 +405,8 @@ class ClearingHouse:
         Misión 3: Ejecución de trading automático de corto y mediano plazo.
         Toma decisiones autónomas de apertura sin intervención humana.
         """
-        if decision_info["status"] != "APPROVED":
-            sys_log.info(f"Cámara de Compensación: Compra descartada para {ticker}. Estado: {decision_info['status']}")
+        if decision_info["status"] == "REJECTED" or decision_info["recommendation"] == "BLOCKED":
+            sys_log.info(f"Cámara de Compensación: Compra rechazada para {ticker}. Estado: {decision_info['status']}")
             return
 
         # Intentar arbitraje primero si hay diferencial
@@ -333,7 +419,16 @@ class ClearingHouse:
             sys_log.info(f"Cámara de Compensación: Saldo insuficiente (${usd_balance:.2f} USD).")
             return
 
-        order_size_usd = min(usd_balance * 0.1, 100.0)
+        # Tamaño de orden base: 10% del balance o $100
+        base_order_size = min(usd_balance * 0.1, 100.0)
+        
+        # Si tiene estado WARNING, reducir la exposición al 50%
+        if decision_info["status"] == "WARNING":
+            order_size_usd = base_order_size * 0.5
+            sys_log.warning(f"Cámara de Compensación: Exposición reducida al 50% (${order_size_usd:.2f} USD) para {ticker} por advertencias activas.")
+        else:
+            order_size_usd = base_order_size
+
         quantity = order_size_usd / current_price
         strategy = decision_info["recommendation"]
 
@@ -344,7 +439,7 @@ class ClearingHouse:
         current_token_balance = self.db.get_balance(ticker)
         self.db.update_balance(ticker, current_token_balance + quantity)
 
-        reason = f"Compra automática aprobada por DecisionEngine. Estrategia: {strategy}."
+        reason = f"Compra automática aprobada. Estrategia: {strategy}. Estado: {decision_info['status']}."
         trade_id = self.db.open_simulated_trade(ticker, strategy, current_price, quantity, reason)
 
         alert_log.info(
