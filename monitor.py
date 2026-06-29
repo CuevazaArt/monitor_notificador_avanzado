@@ -2,20 +2,11 @@ import os
 import time
 import logging
 import re
-import requests
+import asyncio
+import aiohttp
 from datetime import datetime
 from dotenv import load_dotenv
 from database import Database
-
-# Configuración de Logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("monitor.log", encoding="utf-8")
-    ]
-)
 
 # Cargar variables de entorno
 load_dotenv()
@@ -25,6 +16,12 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 HEARTBEAT_INTERVAL_HOURS = float(os.getenv("HEARTBEAT_INTERVAL_HOURS", 12))
+SIMULATED_BUDGET = float(os.getenv("SIMULATED_BUDGET", 1000.0))
+
+# APIs de Anuncios
+BINANCE_API = "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"
+BYBIT_API = "https://api.bybit.com/v5/announcements/index"
+OKX_API = "https://www.okx.com/api/v5/support/announcements"
 
 # Encabezados HTTP comunes para evitar bloqueos
 HEADERS = {
@@ -34,7 +31,40 @@ HEADERS = {
 }
 
 # =====================================================================
-# CLASES BASE Y FUENTES DE DATOS (ARQUITECTURA AGNÓSTICA)
+# SISTEMA DE LOGS DEDICADOS Y SEPARADOS
+# =====================================================================
+
+def setup_loggers():
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    
+    # 1. Logger del Sistema (system.log) - Registro general y métricas
+    sys_logger = logging.getLogger("system")
+    sys_logger.setLevel(logging.INFO)
+    sys_handler = logging.FileHandler("system.log", encoding="utf-8")
+    sys_handler.setFormatter(formatter)
+    sys_logger.addHandler(sys_handler)
+    sys_logger.addHandler(logging.StreamHandler())
+    
+    # 2. Logger de Alertas y Operaciones (alerts.log) - Alertas y compras/ventas
+    alert_logger = logging.getLogger("alerts")
+    alert_logger.setLevel(logging.INFO)
+    alert_handler = logging.FileHandler("alerts.log", encoding="utf-8")
+    alert_handler.setFormatter(formatter)
+    alert_logger.addHandler(alert_handler)
+    
+    # 3. Logger de Errores y Excepciones (errors.log) - Registro de fallas
+    err_logger = logging.getLogger("errors")
+    err_logger.setLevel(logging.ERROR)
+    err_handler = logging.FileHandler("errors.log", encoding="utf-8")
+    err_handler.setFormatter(formatter)
+    err_logger.addHandler(err_handler)
+    
+    return sys_logger, alert_logger, err_logger
+
+sys_log, alert_log, err_log = setup_loggers()
+
+# =====================================================================
+# CLASES BASE Y FUENTES DE DATOS ASÍNCRONAS
 # =====================================================================
 
 class BaseSource:
@@ -42,179 +72,305 @@ class BaseSource:
     def __init__(self, name):
         self.name = name
 
-    def fetch_announcements(self):
-        """
-        Debe consultar la fuente y devolver una lista de diccionarios con el formato:
-        [
-            {"title": str, "code": str, "url": str},
-            ...
-        ]
-        """
+    async def fetch_announcements(self, session: aiohttp.ClientSession):
+        """Devuelve una lista de diccionarios con el formato: [{"title": str, "code": str, "url": str}]"""
         raise NotImplementedError
 
 
 class BinanceSource(BaseSource):
     def __init__(self):
         super().__init__("Binance")
-        self.api_url = "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"
+        self.api_url = BINANCE_API
 
-    def fetch_announcements(self):
+    async def fetch_announcements(self, session: aiohttp.ClientSession):
         params = {
             "type": 1,
-            "catalogId": 48,  # ID 48: Nuevos listados
+            "catalogId": 48,
             "pageNo": 1,
             "pageSize": 5
         }
-        response = requests.get(self.api_url, params=params, headers=HEADERS, timeout=5)
-        articles = []
-        if response.status_code == 200:
-            data = response.json()
-            items = data.get("data", {}).get("catalogs", [{}])[0].get("articles", [])
-            for item in items:
-                articles.append({
-                    "title": item.get("title"),
-                    "code": str(item.get("code")),
-                    "url": f"https://www.binance.com/en/support/announcement/{item.get('code')}"
-                })
-        else:
-            raise requests.exceptions.HTTPError(f"HTTP {response.status_code}")
-        return articles
+        try:
+            async with session.get(self.api_url, params=params, headers=HEADERS, timeout=5) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    items = data.get("data", {}).get("catalogs", [{}])[0].get("articles", [])
+                    articles = []
+                    for item in items:
+                        articles.append({
+                            "title": item.get("title"),
+                            "code": str(item.get("code")),
+                            "url": f"https://www.binance.com/en/support/announcement/{item.get('code')}"
+                        })
+                    return articles
+                else:
+                    raise aiohttp.ClientResponseError(response.request_info, response.history, status=response.status)
+        except Exception as e:
+            err_log.error(f"Error HTTP en BinanceSource: {e}", exc_info=True)
+            raise
 
 
 class BybitSource(BaseSource):
     def __init__(self):
         super().__init__("Bybit")
-        self.api_url = "https://api.bybit.com/v5/announcements/index"
+        self.api_url = BYBIT_API
 
-    def fetch_announcements(self):
+    async def fetch_announcements(self, session: aiohttp.ClientSession):
         params = {
             "locale": "en-US",
             "limit": 5
         }
-        response = requests.get(self.api_url, params=params, headers=HEADERS, timeout=5)
-        articles = []
-        if response.status_code == 200:
-            data = response.json()
-            items = data.get("result", {}).get("list", [])
-            for item in items:
-                url = item.get("url")
-                code = url.strip("/").split("/")[-1] if url else None
-                articles.append({
-                    "title": item.get("title"),
-                    "code": code,
-                    "url": url
-                })
-        else:
-            raise requests.exceptions.HTTPError(f"HTTP {response.status_code}")
-        return articles
+        try:
+            async with session.get(self.api_url, params=params, headers=HEADERS, timeout=5) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    items = data.get("result", {}).get("list", [])
+                    articles = []
+                    for item in items:
+                        url = item.get("url")
+                        code = url.strip("/").split("/")[-1] if url else None
+                        articles.append({
+                            "title": item.get("title"),
+                            "code": code,
+                            "url": url
+                        })
+                    return articles
+                else:
+                    raise aiohttp.ClientResponseError(response.request_info, response.history, status=response.status)
+        except Exception as e:
+            err_log.error(f"Error HTTP en BybitSource: {e}", exc_info=True)
+            raise
 
 
 class OKXSource(BaseSource):
     def __init__(self):
         super().__init__("OKX")
-        self.api_url = "https://www.okx.com/api/v5/support/announcements"
+        self.api_url = OKX_API
 
-    def fetch_announcements(self):
-        response = requests.get(self.api_url, headers=HEADERS, timeout=5)
-        articles = []
-        if response.status_code == 200:
-            data = response.json()
-            details = data.get("data", [{}])[0].get("details", [])
-            for item in details:
-                url = item.get("url")
-                code = url.strip("/").split("/")[-1] if url else None
-                articles.append({
-                    "title": item.get("title"),
-                    "code": code,
-                    "url": url
-                })
-        else:
-            raise requests.exceptions.HTTPError(f"HTTP {response.status_code}")
-        return articles
+    async def fetch_announcements(self, session: aiohttp.ClientSession):
+        try:
+            async with session.get(self.api_url, headers=HEADERS, timeout=5) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    details = data.get("data", [{}])[0].get("details", [])
+                    articles = []
+                    for item in details:
+                        url = item.get("url")
+                        code = url.strip("/").split("/")[-1] if url else None
+                        articles.append({
+                            "title": item.get("title"),
+                            "code": code,
+                            "url": url
+                        })
+                    return articles
+                else:
+                    raise aiohttp.ClientResponseError(response.request_info, response.history, status=response.status)
+        except Exception as e:
+            err_log.error(f"Error HTTP en OKXSource: {e}", exc_info=True)
+            raise
 
 # =====================================================================
-# CENTRO DE EVALUACIÓN Y DECISIONES (DUNE, CRYPTOQUANT Y MORALIS)
+# CENTRO DE EVALUACIÓN Y DECISIONES ASÍNCRONO
 # =====================================================================
 
 class DecisionEngine:
-    """Motor central que evalúa tokens cruzando datos on-chain y macro flujos."""
     def __init__(self, db):
         self.db = db
         self.dune_key = os.getenv("DUNE_API_KEY")
         self.cq_key = os.getenv("CRYPTOQUANT_API_KEY")
         self.moralis_key = os.getenv("MORALIS_API_KEY")
 
-    def evaluate_token(self, ticker, contract_address):
-        """
-        Consulta las APIs configuradas y determina si aprueba o pone en precaución la operación.
-        """
+    async def evaluate_token(self, session: aiohttp.ClientSession, ticker, contract_address):
         results = {
-            "status": "APPROVED",  # APPROVED, WARNING, REJECTED
+            "status": "APPROVED",
             "warnings": [],
-            "metrics": {}
+            "metrics": {},
+            "recommendation": "SHORT_ARB"  # SHORT_ARB o MID_TERM
         }
+
+        # Ejecutamos las validaciones en paralelo usando asyncio.gather
+        tasks = []
         
-        # 1. Validación de Flujos de CEXs (CryptoQuant)
-        # Si se configura la llave, consultamos la tasa de flujos de ballenas entrantes a los exchanges
         if self.cq_key and self.cq_key != "YOUR_KEY":
-            try:
-                # Url real de CryptoQuant (ejemplo ilustrativo de consumo de API)
-                url = "https://api.cryptoquant.com/v1/btc/exchange-flows/inflow?window=day&limit=1"
-                headers = {"Authorization": f"Bearer {self.cq_key}"}
-                response = requests.get(url, headers=headers, timeout=5)
-                if response.status_code == 200:
-                    # En una lógica real evaluaríamos la desviación estándar de la métrica
-                    # Para demo, registramos la métrica
-                    results["metrics"]["CryptoQuant Inflow State"] = "Normal (Baja presión de venta)"
-                else:
-                    results["warnings"].append(f"CryptoQuant: API retornó código {response.status_code}")
-            except Exception as e:
-                logging.error(f"Error en consulta de CryptoQuant: {e}")
-                self.db.log_system("ERROR", f"Error CryptoQuant: {e}")
-
-        # 2. Validación de Estadísticas de Holders y Volumen en DEXs (Dune Analytics)
+            tasks.append(self._validate_cryptoquant(session))
         if self.dune_key and self.dune_key != "YOUR_KEY":
-            try:
-                # Dune permite ejecutar una Query predefinida pasando la dirección del contrato como parámetro
-                # https://api.dune.com/api/v1/query/{query_id}/execute
-                # Aquí simulamos una respuesta exitosa con métricas reales para ilustrar la lógica de decisión
-                # En producción, usarías requests.post con el DUNE_API_KEY en las cabeceras
-                results["metrics"]["Dune Weekly Volume"] = "$1.24M USD"
-                results["metrics"]["Dune Unique Holders"] = "4,821 addresses"
-            except Exception as e:
-                logging.error(f"Error en consulta de Dune: {e}")
-                self.db.log_system("ERROR", f"Error Dune: {e}")
-
-        # 3. Validación de Metadatos y Seguridad del Contrato (Moralis)
+            tasks.append(self._validate_dune(session))
         if self.moralis_key and self.moralis_key != "YOUR_KEY" and contract_address != "N/A":
-            try:
-                # Consultar metadatos del token para validar si el contrato es legítimo
-                url = f"https://deep-index.moralis.io/api/v2.2/erc20/metadata?addresses%5B%5D={contract_address}"
-                headers = {
-                    "accept": "application/json",
-                    "X-API-Key": self.moralis_key
-                }
-                response = requests.get(url, headers=headers, timeout=5)
-                if response.status_code == 200:
-                    data = response.json()
-                    if data:
-                        token_meta = data[0]
-                        results["metrics"]["Moralis Name"] = token_meta.get("name", "N/A")
-                        results["metrics"]["Moralis Symbol"] = token_meta.get("symbol", "N/A")
-                        # Si no coincide el símbolo o tiene métricas extrañas, alerta
-                        if token_meta.get("symbol", "").upper() != ticker.upper():
-                            results["warnings"].append("⚠️ Moralis: Discrepancia detectada entre el símbolo CEX y On-Chain.")
-                            results["status"] = "WARNING"
-                else:
-                    results["warnings"].append(f"Moralis: API retornó código {response.status_code}")
-            except Exception as e:
-                logging.error(f"Error en consulta de Moralis: {e}")
-                self.db.log_system("ERROR", f"Error Moralis: {e}")
-                
+            tasks.append(self._validate_moralis(session, ticker, contract_address))
+
+        if tasks:
+            completed_tasks = await asyncio.gather(*tasks, return_exceptions=True)
+            for task_res in completed_tasks:
+                if isinstance(task_res, dict):
+                    results["warnings"].extend(task_res.get("warnings", []))
+                    results["metrics"].update(task_res.get("metrics", {}))
+                    if task_res.get("status") == "WARNING":
+                        results["status"] = "WARNING"
+
+        # Lógica de Selección de Estrategia (Arbitraje vs. Acumulación Mediano Plazo)
+        # Si el token tiene buenas métricas de Dune (volumen profundo y holders), se recomienda Mid-Term
+        holders_count = results["metrics"].get("Dune Unique Holders", "0")
+        try:
+            holders_num = int(re.sub(r'\D', '', str(holders_count)))
+        except ValueError:
+            holders_num = 0
+
+        # Criterio de Mediano Plazo: Holders > 1000, sin alertas críticas
+        if holders_num >= 1000 and results["status"] == "APPROVED":
+            results["recommendation"] = "MID_TERM"
+            
         return results
 
+    async def _validate_cryptoquant(self, session: aiohttp.ClientSession):
+        res = {"status": "APPROVED", "warnings": [], "metrics": {}}
+        url = "https://api.cryptoquant.com/v1/btc/exchange-flows/inflow?window=day&limit=1"
+        headers = {"Authorization": f"Bearer {self.cq_key}"}
+        try:
+            async with session.get(url, headers=headers, timeout=5) as response:
+                if response.status == 200:
+                    res["metrics"]["CryptoQuant Inflow State"] = "Normal (Baja presión)"
+                else:
+                    res["warnings"].append(f"CryptoQuant retornó HTTP {response.status}")
+        except Exception as e:
+            err_log.error(f"Excepción en CryptoQuant API: {e}")
+            res["warnings"].append(f"CryptoQuant: Fallo de conexión")
+        return res
+
+    async def _validate_dune(self, session: aiohttp.ClientSession):
+        # Simulación de respuesta estructurada para Dune (con key cargada)
+        await asyncio.sleep(0.1)
+        return {
+            "status": "APPROVED",
+            "warnings": [],
+            "metrics": {
+                "Dune Weekly Volume": "$1.52M USD",
+                "Dune Unique Holders": "1,450 addresses"
+            }
+        }
+
+    async def _validate_moralis(self, session: aiohttp.ClientSession, ticker, contract_address):
+        res = {"status": "APPROVED", "warnings": [], "metrics": {}}
+        url = f"https://deep-index.moralis.io/api/v2.2/erc20/metadata?addresses%5B%5D={contract_address}"
+        headers = {
+            "accept": "application/json",
+            "X-API-Key": self.moralis_key
+        }
+        try:
+            async with session.get(url, headers=headers, timeout=5) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data:
+                        token_meta = data[0]
+                        res["metrics"]["Moralis Name"] = token_meta.get("name", "N/A")
+                        res["metrics"]["Moralis Symbol"] = token_meta.get("symbol", "N/A")
+                        if token_meta.get("symbol", "").upper() != ticker.upper():
+                            res["warnings"].append("⚠️ Moralis: Símbolos incongruentes entre CEX y cadena.")
+                            res["status"] = "WARNING"
+                else:
+                    res["warnings"].append(f"Moralis retornó HTTP {response.status}")
+        except Exception as e:
+            err_log.error(f"Excepción en Moralis API: {e}")
+            res["warnings"].append(f"Moralis: Fallo de conexión")
+        return res
+
 # =====================================================================
-# MOTOR PRINCIPAL DEL MONITOR
+# CÁMARA DE COMPENSACIÓN (CLEARING HOUSE) - SIMULADOR DE TRADING
+# =====================================================================
+
+class ClearingHouse:
+    def __init__(self, db: Database):
+        self.db = db
+        self.db.init_portfolio_balance(SIMULATED_BUDGET)
+
+    async def evaluate_and_trade(self, ticker, contract_address, decision_info, current_price):
+        """
+        Determina la compra del activo a partir de las decisiones del DecisionEngine
+        y el saldo disponible en la Cámara de Compensación.
+        """
+        if decision_info["status"] != "APPROVED":
+            sys_log.info(f"Cámara de Compensación: Compra descartada para {ticker}. Estado: {decision_info['status']}")
+            return
+
+        # Verificar saldo en USD
+        usd_balance = self.db.get_balance("USD")
+        if usd_balance < 10.0:
+            sys_log.info(f"Cámara de Compensación: Saldo insuficiente (${usd_balance:.2f} USD).")
+            return
+
+        # Asignación del tamaño de orden: 10% del saldo actual o $100 (el menor)
+        order_size_usd = min(usd_balance * 0.1, 100.0)
+        quantity = order_size_usd / current_price
+        strategy = decision_info["recommendation"]
+
+        # Ejecutar Compra (Simulada)
+        new_usd_balance = usd_balance - order_size_usd
+        self.db.update_balance("USD", new_usd_balance)
+        
+        # Aumentar tenencia del token
+        current_token_balance = self.db.get_balance(ticker)
+        self.db.update_balance(ticker, current_token_balance + quantity)
+
+        # Registrar orden en base de datos
+        reason = f"Compra automática aprobada. Estrategia: {strategy}. Liquidez OK."
+        trade_id = self.db.open_simulated_trade(ticker, strategy, current_price, quantity, reason)
+
+        alert_log.info(
+            f"💰 [COMPRA SIMULADA] {ticker} | Cantidad: {quantity:.4f} | "
+            f"Precio Entrada: ${current_price:.6f} | Estrategia: {strategy} | ID Trade: {trade_id}"
+        )
+
+    async def manage_open_positions(self, get_current_price_func):
+        """
+        Monitorea posiciones abiertas para ejecutar salidas por límite de tiempo
+        o trailing stop.
+        """
+        open_trades = self.db.get_open_trades()
+        if not open_trades:
+            return
+
+        for trade in open_trades:
+            trade_id = trade["id"]
+            ticker = trade["ticker"]
+            strategy = trade["strategy_type"]
+            entry_time = datetime.strptime(trade["timestamp_entry"], "%Y-%m-%d %H:%M:%S")
+            elapsed_seconds = (datetime.utcnow() - entry_time).total_seconds()
+            
+            # Obtener el precio on-chain actual para el cálculo de PnL
+            current_price = await get_current_price_func(ticker)
+            if not current_price:
+                current_price = trade["entry_price"] # Fallback
+
+            should_close = False
+            close_reason = ""
+
+            # Lógica de Salida según Estrategia
+            if strategy == "SHORT_ARB" and elapsed_seconds >= 300:  # 5 minutos
+                should_close = True
+                close_reason = "Salida por tiempo de arbitraje (5 min)."
+            elif strategy == "MID_TERM" and elapsed_seconds >= 86400 * 3:  # 3 días
+                should_close = True
+                close_reason = "Salida por tiempo de acumulación mediano plazo (3 días)."
+
+            if should_close:
+                # Ejecutar venta
+                token_balance = self.db.get_balance(ticker)
+                sell_quantity = min(token_balance, trade["quantity"])
+                pnl = (current_price - trade["entry_price"]) * sell_quantity
+
+                # Actualizar balances
+                usd_balance = self.db.get_balance("USD")
+                self.db.update_balance("USD", usd_balance + (sell_quantity * current_price))
+                self.db.update_balance(ticker, token_balance - sell_quantity)
+
+                # Registrar cierre en base de datos
+                self.db.close_simulated_trade(trade_id, current_price, pnl, close_reason)
+
+                alert_log.info(
+                    f"💰 [VENTA SIMULADA] {ticker} | Cantidad: {sell_quantity:.4f} | "
+                    f"Precio Salida: ${current_price:.6f} | PnL: ${pnl:+.2f} USD | Razón: {close_reason}"
+                )
+
+# =====================================================================
+# MOTOR PRINCIPAL ASÍNCRONO
 # =====================================================================
 
 class ListingMonitor:
@@ -223,8 +379,9 @@ class ListingMonitor:
         self.start_time = time.time()
         self.last_heartbeat_time = time.time()
         self.decision_engine = DecisionEngine(self.db)
+        self.clearing_house = ClearingHouse(self.db)
         
-        # Lista agnóstica de fuentes de datos activas
+        # Lista agnóstica de fuentes de datos
         self.sources = [
             BinanceSource(),
             BybitSource(),
@@ -246,7 +403,6 @@ class ListingMonitor:
         return " ".join(parts)
 
     def extract_ticker(self, title):
-        """Extrae el ticker/símbolo en mayúsculas de un título de anuncio."""
         match = re.search(r'\(([A-Z0-9]{2,10})\)', title)
         if match:
             return match.group(1)
@@ -265,37 +421,53 @@ class ListingMonitor:
                 return word
         return None
 
-    def check_onchain_status(self, ticker):
-        """Vigilancia On-chain: Consulta DexScreener para buscar pools de liquidez activos."""
+    async def get_token_price_onchain(self, ticker):
+        """Obtiene el precio del par más líquido en DexScreener de forma asíncrona."""
         url = f"https://api.dexscreener.com/latest/dex/search?q={ticker}"
         try:
-            response = requests.get(url, headers=HEADERS, timeout=5)
-            if response.status_code == 200:
-                data = response.json()
-                pairs = data.get("pairs", [])
-                if not pairs:
-                    return None
-                
-                valid_pairs = [p for p in pairs if p.get("liquidity", {}).get("usd") is not None]
-                if not valid_pairs:
-                    return None
-                    
-                best_pair = max(valid_pairs, key=lambda p: p["liquidity"]["usd"])
-                base_token = best_pair.get("baseToken", {})
-                
-                return {
-                    "chain": best_pair.get("chainId", "desconocida").upper(),
-                    "dex": best_pair.get("dexId", "desconocido").upper(),
-                    "contract": base_token.get("address", "N/A"),
-                    "liquidity_usd": best_pair.get("liquidity", {}).get("usd", 0),
-                    "price_usd": best_pair.get("priceUsd", "0.0"),
-                    "pair_url": best_pair.get("url", "")
-                }
-        except Exception as e:
-            logging.error(f"Error en vigilancia on-chain (DexScreener) para {ticker}: {e}")
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=HEADERS, timeout=5) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        pairs = data.get("pairs", [])
+                        valid_pairs = [p for p in pairs if p.get("liquidity", {}).get("usd") is not None]
+                        if valid_pairs:
+                            best_pair = max(valid_pairs, key=lambda p: p["liquidity"]["usd"])
+                            return float(best_pair.get("priceUsd", 0.0))
+        except Exception:
+            pass
         return None
 
-    def send_notification(self, title, url, source, is_delisting=False, onchain_info=None, decision_info=None):
+    async def check_onchain_status(self, session: aiohttp.ClientSession, ticker):
+        url = f"https://api.dexscreener.com/latest/dex/search?q={ticker}"
+        try:
+            async with session.get(url, headers=HEADERS, timeout=5) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    pairs = data.get("pairs", [])
+                    if not pairs:
+                        return None
+                    
+                    valid_pairs = [p for p in pairs if p.get("liquidity", {}).get("usd") is not None]
+                    if not valid_pairs:
+                        return None
+                        
+                    best_pair = max(valid_pairs, key=lambda p: p["liquidity"]["usd"])
+                    base_token = best_pair.get("baseToken", {})
+                    
+                    return {
+                        "chain": best_pair.get("chainId", "desconocida").upper(),
+                        "dex": best_pair.get("dexId", "desconocido").upper(),
+                        "contract": base_token.get("address", "N/A"),
+                        "liquidity_usd": best_pair.get("liquidity", {}).get("usd", 0),
+                        "price_usd": best_pair.get("priceUsd", "0.0"),
+                        "pair_url": best_pair.get("url", "")
+                    }
+        except Exception as e:
+            err_log.error(f"Error en DexScreener para {ticker}: {e}")
+        return None
+
+    async def send_notification(self, title, url, source, is_delisting=False, onchain_info=None, decision_info=None):
         emoji = "⚠️ [DESLISTADO]" if is_delisting else "🚀 [LISTADO]"
         message = (
             f"{emoji} **Nuevo Anuncio Detectado en {source}**\n\n"
@@ -314,10 +486,12 @@ class ListingMonitor:
             )
             
         if decision_info:
-            status_emoji = "🟢 APROBADO" if decision_info["status"] == "APPROVED" else "🟡 ADVERTENCIA"
+            status_emoji = "🟢 APROBADO" if decision_info["status"] == "APPROVED" else "Adver"
+            strategy_text = "Mediano Plazo (Acumulación)" if decision_info["recommendation"] == "MID_TERM" else "Arbitraje Rápido (HFT)"
             message += (
                 f"\n\n🧠 **Centro de Decisiones e Inteligencia Cripto:**\n"
                 f"• Validación Operativa: **{status_emoji}**\n"
+                f"• Estrategia Sugerida: **{strategy_text}**\n"
             )
             if decision_info["warnings"]:
                 message += "• Alertas:\n"
@@ -328,16 +502,20 @@ class ListingMonitor:
                 for key, val in decision_info["metrics"].items():
                     message += f"  - {key}: {val}\n"
             
-        self._dispatch_message(message)
+        # Despachar mensaje de alerta
+        await self._dispatch_message(message)
 
-    def send_heartbeat_report(self):
-        logging.info("Compilando y enviando reporte de control (heartbeat) a Telegram...")
+    async def send_heartbeat_report(self):
+        sys_log.info("Compilando y enviando reporte de control (heartbeat) a Telegram...")
         
         summary = self.db.get_metrics_summary(hours=HEARTBEAT_INTERVAL_HOURS)
         total_alerts = self.db.get_total_alerts_count(hours=HEARTBEAT_INTERVAL_HOURS)
         uptime = self.get_uptime_str()
         
-        # Determinar estado de salud del sistema
+        # Saldo y estadísticas de la Cámara de Compensación
+        usd_balance = self.db.get_balance("USD")
+        trade_summary = self.db.get_trading_summary()
+        
         system_status = "🟢 OK"
         failed_sources = []
         for src, metrics in summary.items():
@@ -352,7 +530,7 @@ class ListingMonitor:
             metrics_details += (
                 f"• *{src}*:\n"
                 f"  - Latencia Promedio: {metrics['avg_latency']} ms\n"
-                f"  - Éxito Peticiones: {success_rate:.1f}% ({metrics['total'] - metrics['errors']}/{metrics['total']})\n"
+                f"  - Éxito Peticiones: {success_rate:.1f}%\n"
             )
             
         status_msg = f" (Problemas con: {', '.join(failed_sources)})" if failed_sources else ""
@@ -362,21 +540,27 @@ class ListingMonitor:
             f"• *Estado General del Sistema:* {system_status}{status_msg}\n"
             f"• *Tiempo de Actividad (Uptime):* {uptime}\n"
             f"• *Alertas Detectadas (Últimas {HEARTBEAT_INTERVAL_HOURS}h):* {total_alerts}\n\n"
-            f"*Métricas de Servicios Adyacentes (APIs)*:\n{metrics_details or 'Sin datos en este ciclo.'}\n"
-            f"El monitor sigue escuchando 24/7 de forma perpetua."
+            f"💰 *Cámara de Compensación (Simulado)*:\n"
+            f"  - Balance USD Disponible: ${usd_balance:.2f} USD\n"
+            f"  - Retorno Neto P&L: {trade_summary['profit_loss']:+.2f} USD\n"
+            f"  - Total Trades: {trade_summary['total_trades']} | Tasa Acierto: {trade_summary['win_rate']}%\n\n"
+            f"*Métricas de APIs*:\n{metrics_details or 'Sin datos en este ciclo.'}\n"
+            f"El monitor sigue escuchando 24/7."
         )
         
-        self._dispatch_message(message, is_heartbeat=True)
+        await self._dispatch_message(message, is_heartbeat=True)
 
-    def _dispatch_message(self, message, is_heartbeat=False):
+    async def _dispatch_message(self, message, is_heartbeat=False):
+        # Despachar a Discord (solo alertas)
         if DISCORD_WEBHOOK_URL and not is_heartbeat:
             try:
-                requests.post(DISCORD_WEBHOOK_URL, json={"content": message}, timeout=5)
-                logging.info("Notificación enviada a Discord.")
+                async with aiohttp.ClientSession() as session:
+                    await session.post(DISCORD_WEBHOOK_URL, json={"content": message}, timeout=5)
             except Exception as e:
-                logging.error(f"Error al enviar notificación a Discord: {e}")
-                self.db.log_system("ERROR", f"Fallo al notificar Discord: {e}")
+                err_log.error(f"Fallo al notificar Discord: {e}")
+                self.db.log_system("ERROR", f"Discord fail: {e}")
                 
+        # Despachar a Telegram
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
             try:
                 telegram_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -385,13 +569,13 @@ class ListingMonitor:
                     "text": message.replace("**", "*"),
                     "parse_mode": "Markdown"
                 }
-                requests.post(telegram_url, json=payload, timeout=5)
-                logging.info("Notificación enviada a Telegram.")
+                async with aiohttp.ClientSession() as session:
+                    await session.post(telegram_url, json=payload, timeout=5)
             except Exception as e:
-                logging.error(f"Error al enviar notificación a Telegram: {e}")
-                self.db.log_system("ERROR", f"Fallo al notificar Telegram: {e}")
+                err_log.error(f"Fallo al notificar Telegram: {e}")
+                self.db.log_system("ERROR", f"Telegram fail: {e}")
 
-    def parse_and_check(self, title, code, url, source):
+    async def parse_and_check(self, session: aiohttp.ClientSession, title, code, url, source):
         if not title or not code:
             return
             
@@ -405,7 +589,7 @@ class ListingMonitor:
         if is_listing or is_delisting:
             is_new = self.db.log_alert(source, code, title, url, is_delisting)
             if is_new:
-                logging.warning(f"¡NUEVA ALERTA REGISTRADA ({source})! {title}")
+                alert_log.warning(f"¡NUEVA ALERTA ({source})! {title}")
                 
                 # Vigilancia On-Chain
                 onchain_info = None
@@ -413,62 +597,75 @@ class ListingMonitor:
                 if is_listing:
                     ticker = self.extract_ticker(title)
                     if ticker:
-                        logging.info(f"Ticker detectado ({ticker}). Buscando pools on-chain...")
-                        onchain_info = self.check_onchain_status(ticker)
+                        sys_log.info(f"Ticker detectado ({ticker}). Buscando pools on-chain...")
+                        onchain_info = await self.check_onchain_status(session, ticker)
                         
-                        # Centro de Evaluación y Decisiones (Dune, CryptoQuant, Moralis)
+                        # Decision Engine
                         contract_address = onchain_info["contract"] if onchain_info else "N/A"
-                        decision_info = self.decision_engine.evaluate_token(ticker, contract_address)
+                        decision_info = await self.decision_engine.evaluate_token(session, ticker, contract_address)
+                        
+                        # Ejecutar orden simulada en la Cámara de Compensación si hay liquidez y precio
+                        if onchain_info and onchain_info["price_usd"] != "0.0":
+                            price = float(onchain_info["price_usd"])
+                            await self.clearing_house.evaluate_and_trade(ticker, contract_address, decision_info, price)
                 
-                self.send_notification(title, url, source, is_delisting, onchain_info, decision_info)
+                await self.send_notification(title, url, source, is_delisting, onchain_info, decision_info)
+
+    async def monitor_source_task(self, session: aiohttp.ClientSession, source: BaseSource):
+        """Tarea asíncrona de monitoreo periódico para una fuente específica."""
+        start = time.time()
+        try:
+            articles = await source.fetch_announcements(session)
+            latency = (time.time() - start) * 1000
+            self.db.log_api_metric(source.name, latency, 200)
+            for art in articles:
+                await self.parse_and_check(session, art["title"], art["code"], art["url"], source.name)
+        except Exception as e:
+            latency = (time.time() - start) * 1000
+            self.db.log_api_metric(source.name, latency, 0, str(e))
+            self.db.log_system("ERROR", f"Error monitoreando {source.name}: {e}")
+            err_log.error(f"Falla monitoreando fuente {source.name}: {e}", exc_info=True)
+
+    async def main_loop(self):
+        sys_log.info("Inicializando base de datos y cargando estado histórico...")
+        self.db.log_system("SYSTEM", "Monitor asíncrono iniciado con Cámara de Compensación.")
+        
+        async with aiohttp.ClientSession() as session:
+            # Carga inicial silenciosa
+            init_tasks = [self.monitor_source_task(session, src) for src in self.sources]
+            await asyncio.gather(*init_tasks)
+            
+            startup_msg = "🟢 *[SISTEMA] Monitor de CEXs iniciado, operando 24/7 de forma asíncrona con Cámara de Compensación activa.*"
+            await self._dispatch_message(startup_msg, is_heartbeat=True)
+            sys_log.info("Arranque exitoso. Monitoreando fuentes en paralelo cada %d segundos...", POLLING_INTERVAL)
+            
+            while True:
+                # Monitoreo asíncrono en paralelo de todas las fuentes
+                tasks = [self.monitor_source_task(session, src) for src in self.sources]
+                await asyncio.gather(*tasks)
+                
+                # Gestionar y cerrar posiciones abiertas de la Cámara de Compensación
+                await self.clearing_house.manage_open_positions(self.get_token_price_onchain)
+                
+                # Reporte de control periódico (heartbeat)
+                current_time = time.time()
+                if current_time - self.last_heartbeat_time >= HEARTBEAT_INTERVAL_HOURS * 3600:
+                    try:
+                        await self.send_heartbeat_report()
+                    except Exception as e:
+                        err_log.error(f"Fallo al compilar reporte: {e}")
+                        self.db.log_system("ERROR", f"Fallo al compilar heartbeat: {e}")
+                    self.last_heartbeat_time = current_time
+                
+                await asyncio.sleep(POLLING_INTERVAL)
 
     def run(self):
-        logging.info("Inicializando bases de datos y cargando estado histórico...")
-        self.db.log_system("SYSTEM", "Monitor iniciado en modo 24/7 continuo y Centro de Decisiones integrado.")
-        
-        # Carga inicial silenciosa
-        for source in self.sources:
-            try:
-                source.fetch_announcements()
-            except Exception:
-                pass
-        
-        startup_msg = "🟢 *[SISTEMA] Monitor de CEXs iniciado, operando 24/7 y con Centro de Decisiones de Mercado activo.*"
-        self._dispatch_message(startup_msg, is_heartbeat=True)
-        logging.info("Arranque exitoso. Escaneando fuentes cada %d segundos...", POLLING_INTERVAL)
-        
-        while True:
-            # Procesar cada fuente de forma agnóstica
-            for source in self.sources:
-                start = time.time()
-                try:
-                    articles = source.fetch_announcements()
-                    latency = (time.time() - start) * 1000
-                    self.db.log_api_metric(source.name, latency, 200)
-                    for art in articles:
-                        self.parse_and_check(art["title"], art["code"], art["url"], source.name)
-                except Exception as e:
-                    latency = (time.time() - start) * 1000
-                    self.db.log_api_metric(source.name, latency, 0, str(e))
-                    self.db.log_system("ERROR", f"Error monitoreando {source.name}: {e}")
-                    logging.error(f"Excepción en fuente {source.name}: {e}")
-            
-            # Control periódico de salud (heartbeat)
-            current_time = time.time()
-            if current_time - self.last_heartbeat_time >= HEARTBEAT_INTERVAL_HOURS * 3600:
-                try:
-                    self.send_heartbeat_report()
-                except Exception as e:
-                    logging.error(f"Fallo al compilar reporte de control: {e}")
-                    self.db.log_system("ERROR", f"Fallo al compilar heartbeat: {e}")
-                self.last_heartbeat_time = current_time
-                
-            time.sleep(POLLING_INTERVAL)
+        try:
+            asyncio.run(self.main_loop())
+        except KeyboardInterrupt:
+            sys_log.info("Monitoreo detenido por el usuario.")
+            self.db.log_system("SYSTEM", "Monitor detenido manualmente.")
 
 if __name__ == "__main__":
     monitor = ListingMonitor()
-    try:
-        monitor.run()
-    except KeyboardInterrupt:
-        logging.info("Monitoreo detenido por el usuario.")
-        monitor.db.log_system("SYSTEM", "Monitor detenido manualmente.")
+    monitor.run()

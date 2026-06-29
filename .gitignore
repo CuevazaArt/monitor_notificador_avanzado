@@ -5,8 +5,11 @@ env/
 
 # Archivos de configuración locales
 .env
-monitor.log
 monitor.db
+monitor.log
+system.log
+alerts.log
+errors.log
 
 # Python caché
 __pycache__/
